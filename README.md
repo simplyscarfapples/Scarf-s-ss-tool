@@ -1,4 +1,4 @@
-# Scarf's SS Tool 1.0
+# Scarf's SS Tool
 
 A Windows GUI for checking a PC for cheat clients during a screenshare the
 other person has agreed to. Results are leads to review, not proof of cheating.
