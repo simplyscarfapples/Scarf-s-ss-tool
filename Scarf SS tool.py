@@ -69,11 +69,13 @@ import csv
 import ctypes
 import ctypes.wintypes as wt
 import gzip
+import hashlib
 import json
 import os
 import queue
 import re
 import string
+import struct
 import threading
 from datetime import datetime, timedelta
 
@@ -128,6 +130,33 @@ kernel32.ReadProcessMemory.argtypes = [
 ]
 kernel32.ReadProcessMemory.restype = wt.BOOL
 kernel32.CloseHandle.argtypes = [wt.HANDLE]
+
+# --- Toolhelp32 bindings, used by the DLL / loaded-module scanner ----------
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("th32ModuleID", wt.DWORD),
+        ("th32ProcessID", wt.DWORD),
+        ("GlblcntUsage", wt.DWORD),
+        ("ProccntUsage", wt.DWORD),
+        ("modBaseAddr", ctypes.POINTER(ctypes.c_byte)),
+        ("modBaseSize", wt.DWORD),
+        ("hModule", wt.HMODULE),
+        ("szModule", wt.WCHAR * 256),
+        ("szExePath", wt.WCHAR * 260),
+    ]
+
+
+kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+kernel32.Module32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32FirstW.restype = wt.BOOL
+kernel32.Module32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+kernel32.Module32NextW.restype = wt.BOOL
 
 
 def is_admin():
@@ -265,6 +294,50 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file):
     finally:
         kernel32.CloseHandle(handle)
     return total_strings, hits
+
+
+# ---------------------------------------------------------------------------
+# DLL / loaded-module scanning
+# ---------------------------------------------------------------------------
+def list_modules(pid):
+    """Return [{'name','path','base','size'}, ...] for a process's loaded
+    modules (DLLs + the main exe), or None if the snapshot couldn't be taken
+    (process may need admin rights, or may have exited)."""
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+    if not snap or snap == wt.HANDLE(-1).value:
+        return None
+    modules = []
+    entry = MODULEENTRY32W()
+    entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+    try:
+        ok = kernel32.Module32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
+            modules.append({
+                "name": entry.szModule,
+                "path": entry.szExePath,
+                "base": base,
+                "size": entry.modBaseSize,
+            })
+            ok = kernel32.Module32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return modules
+
+
+def is_system_module_path(path):
+    windir = os.environ.get("WINDIR", r"C:\Windows").lower()
+    return path.lower().startswith(windir)
+
+
+def get_process_exe_dir(pid):
+    if not psutil:
+        return ""
+    try:
+        exe = psutil.Process(pid).exe()
+        return os.path.dirname(exe)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +521,262 @@ def list_processes_since(ref_epoch):
                 "delta": t - ref_epoch,
             })
     rows.sort(key=lambda r: r["start"])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Shared client-root defaults, used by the Mods Scanner and Servers tabs.
+# Points at each launcher's data folder (not a specific subfolder), since
+# profile-based launchers (CurseForge, Modrinth App, Dawn, Prism/PolyMC/
+# MultiMC, GDLauncher) keep a separate mods/servers.dat per instance rather
+# than one global one - the actual folders get found by a bounded recursive
+# search rather than a single hardcoded path.
+# ---------------------------------------------------------------------------
+CLIENT_ROOT_SUFFIXES = [
+    ("Vanilla (.minecraft)", r".minecraft"),
+    ("Lunar Client", r".lunarclient"),
+    ("Badlion Client", r".badlion"),
+    ("Feather Client", r".feather"),
+    ("Dawn", r".dawn"),
+    ("Modrinth App", r"ModrinthApp"),
+    ("GDLauncher", r"gdlauncher_next"),
+    ("Prism/PolyMC/MultiMC", r"PrismLauncher"),
+]
+
+
+def get_default_client_roots():
+    appdata = os.environ.get("APPDATA", "")
+    userprofile = os.environ.get("USERPROFILE", "")
+    roots = []
+    if appdata:
+        roots += [(label, os.path.join(appdata, suffix)) for label, suffix in CLIENT_ROOT_SUFFIXES]
+    if userprofile:
+        roots.append(("CurseForge App", os.path.join(userprofile, r"curseforge\minecraft\Instances")))
+    return roots
+
+
+def _walk_with_depth_limit(root, max_depth):
+    if not os.path.isdir(root):
+        return
+    root_depth = root.rstrip("\\/").count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip("\\/").count(os.sep) - root_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        yield dirpath, dirnames, filenames
+
+
+def find_dirs_named(root, name, max_depth=6):
+    name_l = name.lower()
+    return [dp for dp, _dn, _fn in _walk_with_depth_limit(root, max_depth)
+            if os.path.basename(dp).lower() == name_l]
+
+
+def find_files_named(root, filename, max_depth=6):
+    name_l = filename.lower()
+    found = []
+    for dirpath, _dn, filenames in _walk_with_depth_limit(root, max_depth):
+        for fn in filenames:
+            if fn.lower() == name_l:
+                found.append(os.path.join(dirpath, fn))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Mods folder scanning (profile/instance-aware)
+# ---------------------------------------------------------------------------
+HASH_SIZE_CAP = 20 * 1024 * 1024  # skip hashing anything bigger than this
+
+
+def find_mods_folders(root, max_depth=6):
+    return find_dirs_named(root, "mods", max_depth)
+
+
+def profile_label_for(found_dir, root):
+    """Best-effort instance/profile name: the folder just above the found dir,
+    falling back further up if that's the launcher root itself."""
+    parent = os.path.dirname(found_dir)
+    label = os.path.basename(parent)
+    root_name = os.path.basename(root.rstrip("\\/"))
+    if not label or label.lower() == root_name.lower():
+        return "(default/global)"
+    return label
+
+
+def list_jars(mods_dir):
+    results = []
+    try:
+        entries = os.listdir(mods_dir)
+    except OSError:
+        return results
+    for fn in entries:
+        if not fn.lower().endswith((".jar", ".jar.disabled")):
+            continue
+        path = os.path.join(mods_dir, fn)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        digest = ""
+        try:
+            if st.st_size <= HASH_SIZE_CAP:
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+            else:
+                digest = "(too large to hash)"
+        except OSError:
+            pass
+        results.append({"file": fn, "path": path, "size": st.st_size,
+                        "modified": datetime.fromtimestamp(st.st_mtime), "sha256": digest})
+    return results
+
+
+def scan_mods(roots, stop=None, progress_cb=None):
+    """roots: [(label, path), ...]. Returns a flat list of jar rows, each
+    tagged with which launcher and profile/instance it came from."""
+    all_dirs = []
+    for label, root in roots:
+        for mdir in find_mods_folders(root):
+            all_dirs.append((label, root, mdir))
+    total = len(all_dirs) or 1
+    rows = []
+    for i, (label, root, mdir) in enumerate(all_dirs):
+        if stop is not None and stop.is_set():
+            break
+        profile = profile_label_for(mdir, root)
+        for jar in list_jars(mdir):
+            jar["launcher"] = label
+            jar["profile"] = profile
+            jar["mods_dir"] = mdir
+            rows.append(jar)
+        if progress_cb:
+            progress_cb((i + 1) * 100 / total)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Recent servers (servers.dat, NBT format)
+# ---------------------------------------------------------------------------
+class NBTReader:
+    """Minimal big-endian NBT reader - just enough to pull server name/ip
+    pairs out of a vanilla-format servers.dat file."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def _read(self, n):
+        b = self.data[self.pos:self.pos + n]
+        if len(b) < n:
+            raise ValueError("truncated NBT data")
+        self.pos += n
+        return b
+
+    def read_byte(self):
+        return struct.unpack(">b", self._read(1))[0]
+
+    def read_short(self):
+        return struct.unpack(">h", self._read(2))[0]
+
+    def read_int(self):
+        return struct.unpack(">i", self._read(4))[0]
+
+    def read_long(self):
+        return struct.unpack(">q", self._read(8))[0]
+
+    def read_float(self):
+        return struct.unpack(">f", self._read(4))[0]
+
+    def read_double(self):
+        return struct.unpack(">d", self._read(8))[0]
+
+    def read_string(self):
+        length = struct.unpack(">H", self._read(2))[0]
+        return self._read(length).decode("utf-8", errors="replace")
+
+    def read_payload(self, tag_type):
+        if tag_type == 1:
+            return self.read_byte()
+        if tag_type == 2:
+            return self.read_short()
+        if tag_type == 3:
+            return self.read_int()
+        if tag_type == 4:
+            return self.read_long()
+        if tag_type == 5:
+            return self.read_float()
+        if tag_type == 6:
+            return self.read_double()
+        if tag_type == 7:
+            n = self.read_int()
+            return self._read(max(n, 0))
+        if tag_type == 8:
+            return self.read_string()
+        if tag_type == 9:
+            item_type = self.read_byte()
+            n = self.read_int()
+            if item_type == 0 or n <= 0:
+                return []
+            return [self.read_payload(item_type) for _ in range(n)]
+        if tag_type == 10:
+            compound = {}
+            while True:
+                t = self.read_byte()
+                if t == 0:
+                    break
+                name = self.read_string()
+                compound[name] = self.read_payload(t)
+            return compound
+        if tag_type == 11:
+            n = self.read_int()
+            return [self.read_int() for _ in range(max(n, 0))]
+        if tag_type == 12:
+            n = self.read_int()
+            return [self.read_long() for _ in range(max(n, 0))]
+        raise ValueError(f"unknown NBT tag type {tag_type}")
+
+    def read_root(self):
+        t = self.read_byte()
+        if t == 0:
+            return None
+        self.read_string()  # root tag name, unused
+        return self.read_payload(t)
+
+
+def parse_nbt_file(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:2] == b"\x1f\x8b":  # some NBT files are gzip-compressed
+        raw = gzip.decompress(raw)
+    return NBTReader(raw).read_root()
+
+
+def get_servers_from_file(path):
+    try:
+        root = parse_nbt_file(path)
+    except Exception:
+        return []
+    if not isinstance(root, dict):
+        return []
+    out = []
+    for s in root.get("servers", []) or []:
+        if isinstance(s, dict):
+            out.append({"name": s.get("name", ""), "ip": s.get("ip", "")})
+    return out
+
+
+def scan_servers(roots, max_depth=6):
+    """roots: [(label, path), ...]. Returns rows: launcher, profile, name, ip, source file."""
+    rows = []
+    for label, root in roots:
+        for dat_path in find_files_named(root, "servers.dat", max_depth):
+            profile = profile_label_for(os.path.dirname(dat_path), root)
+            for s in get_servers_from_file(dat_path):
+                rows.append({"launcher": label, "profile": profile, "name": s["name"],
+                            "ip": s["ip"], "source": dat_path})
     return rows
 
 
@@ -911,6 +1240,136 @@ class MemoryScanTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# DLL Scanner tab
+# ---------------------------------------------------------------------------
+class DLLScannerTab(ttk.Frame):
+    COLUMNS = ("name", "location", "base", "size", "path")
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.rows = []
+        self.proc_map = {}
+        self._build_ui()
+        self.refresh_processes()
+
+    def _build_ui(self):
+        note = ("Lists DLLs (and the main exe) currently loaded into a process - "
+                "catches cheats injected as a module rather than run as their own "
+                "visible program. \"Location\" just tells you whether the file sits "
+                "under Windows' system folder or the game's own folder; anything "
+                "else is worth a closer look, not automatic proof of anything.")
+        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+
+        pf = ttk.LabelFrame(self, text="Target process", padding=8)
+        pf.pack(fill="x", pady=(8, 0))
+        ttk.Label(pf, text="Name contains:").grid(row=0, column=0, sticky="w")
+        self.name_filter = tk.StringVar(value="javaw")
+        ttk.Entry(pf, textvariable=self.name_filter, width=16).grid(row=0, column=1, padx=4)
+        ttk.Button(pf, text="Refresh", command=self.refresh_processes).grid(row=0, column=2)
+        ttk.Label(pf, text="Process:").grid(row=0, column=3, sticky="w", padx=(12, 0))
+        self.proc_var = tk.StringVar()
+        self.proc_combo = ttk.Combobox(pf, textvariable=self.proc_var, width=32, state="readonly")
+        self.proc_combo.grid(row=0, column=4, sticky="we", padx=4)
+        admin_text = "Running as admin" if is_admin() else "Not admin"
+        ttk.Label(pf, text=admin_text, foreground="green" if is_admin() else "gray"
+                  ).grid(row=0, column=5, padx=(12, 0))
+        if not is_admin():
+            ttk.Button(pf, text="Run as admin", command=self.run_admin).grid(row=0, column=6)
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x", pady=(8, 0))
+        self.scan_btn = ttk.Button(ctl, text="Scan loaded modules", command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
+        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
+        widths = {"name": 220, "location": 110, "base": 140, "size": 90, "path": 440}
+        labels = {"name": "Module", "location": "Location", "base": "Base address",
+                  "size": "Size (bytes)", "path": "Full path"}
+        for c in self.COLUMNS:
+            self.tree.heading(c, text=labels[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "path"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def refresh_processes(self):
+        procs = list_processes(self.name_filter.get())
+        self.proc_map = {f"{n} (PID {pid})": pid for pid, n in procs}
+        labels = list(self.proc_map)
+        self.proc_combo["values"] = labels
+        if labels:
+            self.proc_combo.current(0)
+        else:
+            self.proc_var.set("")
+        self.status.set(f"Found {len(labels)} matching process(es).")
+
+    def run_admin(self):
+        if messagebox.askyesno("Run as admin", "Restart this tool with administrator rights?"):
+            relaunch_as_admin()
+            self.winfo_toplevel().destroy()
+
+    def start_scan(self):
+        pid = self.proc_map.get(self.proc_var.get())
+        if not pid:
+            messagebox.showwarning("No process", "No target process selected. Try Refresh.")
+            return
+        modules = list_modules(pid)
+        if modules is None:
+            messagebox.showerror(
+                "Couldn't read modules",
+                f"Could not snapshot modules for PID {pid} (error {ctypes.get_last_error()}). "
+                f"Try 'Run as admin', or the process may have exited.")
+            return
+        game_dir = get_process_exe_dir(pid)
+        self.rows = []
+        for m in modules:
+            if is_system_module_path(m["path"]):
+                location = "system"
+            elif game_dir and m["path"].lower().startswith(game_dir.lower()):
+                location = "game folder"
+            else:
+                location = "other"
+            self.rows.append({**m, "location": location})
+        self.apply_filter()
+        self.status.set(f"PID {pid}: {len(self.rows)} loaded module(s).")
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        f = self.filter_var.get().strip().lower()
+        for m in self.rows:
+            if f and f not in m["name"].lower() and f not in m["path"].lower() and f not in m["location"]:
+                continue
+            self.tree.insert("", "end", values=(
+                m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]))
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["module", "location", "base_address", "size_bytes", "path"])
+            for m in self.rows:
+                w.writerow([m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]])
+        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
 # Recycle Bin tab
 # ---------------------------------------------------------------------------
 class RecycleBinTab(ttk.Frame):
@@ -1110,6 +1569,312 @@ class PrefetchTab(ttk.Frame):
             for r in self.rows:
                 w.writerow([r["program"], r["hash"], fmt_dt(r["created"]),
                            fmt_dt(r["last_run_fs"]), r["run_count"], r["compressed"]])
+        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Mods Scanner tab
+# ---------------------------------------------------------------------------
+class ModsScannerTab(ttk.Frame):
+    COLUMNS = ("launcher", "profile", "file", "size", "modified", "sha256")
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.default_roots = get_default_client_roots()
+        self.default_vars = {}
+        self.custom_paths = []
+        self.rows = []
+        self.worker = None
+        self.stop_event = threading.Event()
+        self._build_ui()
+
+    def _build_ui(self):
+        note = ("Finds every \"mods\" folder under each launcher's data folder, "
+                "including profile/instance-based launchers like CurseForge, "
+                "Modrinth App, and Dawn where each instance keeps its own mods "
+                "folder rather than one global one. Lists each jar with a SHA-256 "
+                "hash (skipped for files over 20 MB) so you can compare against "
+                "known-bad hashes if you keep a list.")
+        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+
+        paths_frame = ttk.LabelFrame(self, text="Search locations", padding=8)
+        paths_frame.pack(fill="x", pady=(8, 0))
+
+        df = ttk.Frame(paths_frame)
+        df.pack(fill="x")
+        ttk.Label(df, text="Default launcher folders (unchecked ones weren't found):"
+                  ).pack(anchor="w")
+        for label, path in self.default_roots:
+            exists = os.path.isdir(path)
+            var = tk.BooleanVar(value=exists)
+            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
+            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
+            self.default_vars[label] = (var, path)
+
+        cf = ttk.Frame(paths_frame)
+        cf.pack(fill="x", pady=(10, 0))
+        ttk.Label(cf, text="Custom launcher/instance folder:").pack(anchor="w")
+        row = ttk.Frame(cf)
+        row.pack(fill="x")
+        self.custom_entry = tk.StringVar()
+        ttk.Entry(row, textvariable=self.custom_entry, width=70).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=self.browse_path).pack(side="left", padx=4)
+        ttk.Button(row, text="Add", command=self.add_custom_path).pack(side="left")
+        self.custom_list = tk.Listbox(cf, height=3)
+        self.custom_list.pack(fill="x", pady=(4, 0))
+        ttk.Button(cf, text="Remove selected", command=self.remove_custom_path
+                  ).pack(anchor="w", pady=(4, 0))
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x", pady=(8, 0))
+        self.scan_btn = ttk.Button(ctl, text="Scan mods", command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
+        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
+        self.progress = ttk.Progressbar(ctl, length=200, maximum=100)
+        self.progress.pack(side="right")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
+        widths = {"launcher": 130, "profile": 150, "file": 220, "size": 90,
+                  "modified": 140, "sha256": 280}
+        labels = {"launcher": "Launcher", "profile": "Profile/instance", "file": "File",
+                  "size": "Size (bytes)", "modified": "Modified", "sha256": "SHA-256"}
+        for c in self.COLUMNS:
+            self.tree.heading(c, text=labels[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "sha256"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def browse_path(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.custom_entry.set(path)
+
+    def add_custom_path(self):
+        path = self.custom_entry.get().strip()
+        if path and path not in self.custom_paths:
+            self.custom_paths.append(path)
+            self.custom_list.insert("end", path)
+        self.custom_entry.set("")
+
+    def remove_custom_path(self):
+        for i in reversed(self.custom_list.curselection()):
+            del self.custom_paths[i]
+            self.custom_list.delete(i)
+
+    def start_scan(self):
+        if self.worker and self.worker.is_alive():
+            return
+        roots = [(label, path) for (label, (var, path)) in self.default_vars.items() if var.get()]
+        roots += [("Custom", p) for p in self.custom_paths]
+        if not roots:
+            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
+            return
+        self.stop_event.clear()
+        self.progress["value"] = 0
+        self.scan_btn.config(state="disabled")
+        self.status.set("Scanning for mods folders...")
+        self.worker = threading.Thread(target=self._worker, args=(roots,), daemon=True)
+        self.worker.start()
+
+    def _worker(self, roots):
+        def on_progress(pct):
+            self.after(0, lambda: self.progress.configure(value=pct))
+        try:
+            rows = scan_mods(roots, self.stop_event, on_progress)
+        except Exception as exc:
+            rows = []
+            self.after(0, lambda: messagebox.showerror("Mods scan failed", str(exc)))
+        self.after(0, lambda: self._finish(rows))
+
+    def _finish(self, rows):
+        self.rows = rows
+        self.apply_filter()
+        self.scan_btn.config(state="normal")
+        self.status.set(f"Found {len(rows)} mod jar(s).")
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        f = self.filter_var.get().strip().lower()
+        for m in self.rows:
+            hay = f"{m['file']} {m['profile']} {m['launcher']}".lower()
+            if f and f not in hay:
+                continue
+            self.tree.insert("", "end", values=(
+                m["launcher"], m["profile"], m["file"], m["size"], fmt_dt(m["modified"]), m["sha256"]))
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["launcher", "profile", "file", "size_bytes", "modified", "sha256", "full_path"])
+            for m in self.rows:
+                w.writerow([m["launcher"], m["profile"], m["file"], m["size"],
+                           fmt_dt(m["modified"]), m["sha256"], m["path"]])
+        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Servers tab (recent/saved servers across launchers and profiles)
+# ---------------------------------------------------------------------------
+class ServersTab(ttk.Frame):
+    COLUMNS = ("launcher", "profile", "name", "ip", "source")
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.default_roots = get_default_client_roots()
+        self.default_vars = {}
+        self.custom_paths = []
+        self.rows = []
+        self.worker = None
+        self._build_ui()
+
+    def _build_ui(self):
+        note = ("Reads servers.dat (the multiplayer server list) from every "
+                "launcher/instance folder found, including profile-based "
+                "launchers where each instance keeps its own list.")
+        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+
+        paths_frame = ttk.LabelFrame(self, text="Search locations", padding=8)
+        paths_frame.pack(fill="x", pady=(8, 0))
+
+        df = ttk.Frame(paths_frame)
+        df.pack(fill="x")
+        ttk.Label(df, text="Default launcher folders (unchecked ones weren't found):"
+                  ).pack(anchor="w")
+        for label, path in self.default_roots:
+            exists = os.path.isdir(path)
+            var = tk.BooleanVar(value=exists)
+            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
+            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
+            self.default_vars[label] = (var, path)
+
+        cf = ttk.Frame(paths_frame)
+        cf.pack(fill="x", pady=(10, 0))
+        ttk.Label(cf, text="Custom launcher/instance folder:").pack(anchor="w")
+        row = ttk.Frame(cf)
+        row.pack(fill="x")
+        self.custom_entry = tk.StringVar()
+        ttk.Entry(row, textvariable=self.custom_entry, width=70).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=self.browse_path).pack(side="left", padx=4)
+        ttk.Button(row, text="Add", command=self.add_custom_path).pack(side="left")
+        self.custom_list = tk.Listbox(cf, height=3)
+        self.custom_list.pack(fill="x", pady=(4, 0))
+        ttk.Button(cf, text="Remove selected", command=self.remove_custom_path
+                  ).pack(anchor="w", pady=(4, 0))
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x", pady=(8, 0))
+        self.scan_btn = ttk.Button(ctl, text="Scan servers", command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
+        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
+        widths = {"launcher": 130, "profile": 150, "name": 200, "ip": 200, "source": 320}
+        labels = {"launcher": "Launcher", "profile": "Profile/instance", "name": "Server name",
+                  "ip": "Address", "source": "Source file"}
+        for c in self.COLUMNS:
+            self.tree.heading(c, text=labels[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "source"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def browse_path(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.custom_entry.set(path)
+
+    def add_custom_path(self):
+        path = self.custom_entry.get().strip()
+        if path and path not in self.custom_paths:
+            self.custom_paths.append(path)
+            self.custom_list.insert("end", path)
+        self.custom_entry.set("")
+
+    def remove_custom_path(self):
+        for i in reversed(self.custom_list.curselection()):
+            del self.custom_paths[i]
+            self.custom_list.delete(i)
+
+    def start_scan(self):
+        if self.worker and self.worker.is_alive():
+            return
+        roots = [(label, path) for (label, (var, path)) in self.default_vars.items() if var.get()]
+        roots += [("Custom", p) for p in self.custom_paths]
+        if not roots:
+            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
+            return
+        self.scan_btn.config(state="disabled")
+        self.status.set("Scanning for servers.dat files...")
+        self.worker = threading.Thread(target=self._worker, args=(roots,), daemon=True)
+        self.worker.start()
+
+    def _worker(self, roots):
+        try:
+            rows = scan_servers(roots)
+        except Exception as exc:
+            rows = []
+            self.after(0, lambda: messagebox.showerror("Server scan failed", str(exc)))
+        self.after(0, lambda: self._finish(rows))
+
+    def _finish(self, rows):
+        self.rows = rows
+        self.apply_filter()
+        self.scan_btn.config(state="normal")
+        self.status.set(f"Found {len(rows)} saved server entr{'y' if len(rows)==1 else 'ies'}.")
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        f = self.filter_var.get().strip().lower()
+        for r in self.rows:
+            hay = f"{r['name']} {r['ip']} {r['profile']} {r['launcher']}".lower()
+            if f and f not in hay:
+                continue
+            self.tree.insert("", "end", values=(
+                r["launcher"], r["profile"], r["name"], r["ip"], r["source"]))
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["launcher", "profile", "server_name", "address", "source_file"])
+            for r in self.rows:
+                w.writerow([r["launcher"], r["profile"], r["name"], r["ip"], r["source"]])
         self.status.set(f"Exported {len(self.rows)} rows to {path}")
 
 
@@ -1694,14 +2459,20 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True)
 
         self.scan_tab = MemoryScanTab(nb)
+        self.dll_tab = DLLScannerTab(nb)
         self.log_tab = LogCheckerTab(nb)
+        self.mods_tab = ModsScannerTab(nb)
+        self.servers_tab = ServersTab(nb)
         self.recycle_tab = RecycleBinTab(nb)
         self.prefetch_tab = PrefetchTab(nb)
         self.timeline_tab = ProcessTimelineTab(nb)
         self.credits_tab = CreditsTab(nb)
 
         nb.add(self.scan_tab, text="Memory Scan")
+        nb.add(self.dll_tab, text="DLL Scanner")
         nb.add(self.log_tab, text="Log Checker")
+        nb.add(self.mods_tab, text="Mods Scanner")
+        nb.add(self.servers_tab, text="Servers")
         nb.add(self.recycle_tab, text="Recycle Bin")
         nb.add(self.prefetch_tab, text="Prefetch")
         nb.add(self.timeline_tab, text="Process Timeline")
@@ -1754,7 +2525,8 @@ class App(tk.Tk):
     def _recolor_classic_widgets(self, c):
         """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas) - do those by hand."""
         text_like = [self.scan_tab.kw_text, self.scan_tab.detail]
-        list_like = [self.log_tab.custom_list, self.log_tab.custom_account_list]
+        list_like = [self.log_tab.custom_list, self.log_tab.custom_account_list,
+                    self.mods_tab.custom_list, self.servers_tab.custom_list]
         canvases = [self.log_tab.scroll_canvas]
         for w in text_like + list_like:
             try:
