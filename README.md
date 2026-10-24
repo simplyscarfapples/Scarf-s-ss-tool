@@ -15,11 +15,15 @@ Missing dependencies (`psutil`) install automatically on first run.
 
 ## Features
 - **Memory Scan** — scans a running process's memory for keyword matches (cheat/client names)
+- **DLL Scanner** — lists DLLs loaded into a process, flags ones outside system/game folders
 - **Log Checker** — scans log files for usernames, listed as possible alts
 - **Launcher Accounts** — lists profile names from launcher account files (no tokens/passwords)
+- **Mods Scanner** — finds mods folders (including per-profile ones like CurseForge/Modrinth/Dawn) and hashes jars
+- **Servers** — lists saved servers from servers.dat across launchers/profiles
 - **Recycle Bin** — shows deleted-file history
 - **Prefetch** — shows program run history
 - **Process Timeline** — lists what launched after a chosen process
+- Dark mode
 - Auto-installs missing dependencies
 
 ## Credits
