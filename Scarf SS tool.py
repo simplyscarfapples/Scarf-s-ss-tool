@@ -1672,7 +1672,11 @@ class App(tk.Tk):
         self.minsize(950, 600)
 
         self.style = ttk.Style(self)
-        self.light_theme = "vista" if "vista" in self.style.theme_names() else "clam"
+        # Always use "clam" (not the native "vista" theme) for BOTH light and dark mode.
+        # "vista" is natively drawn and only partially respects color overrides, which
+        # is what caused light mode text/background to look broken after a theme switch.
+        # "clam" honors every color we set, so both modes render consistently.
+        self.light_theme = "clam"
         self.dark_mode = tk.BooleanVar(value=False)
 
         top = ttk.Frame(self)
