@@ -18,7 +18,7 @@ Everything here reads artifacts already on disk or live process metadata;
 nothing here captures keystrokes or runs hidden/in the background.
 A match or entry is a lead to review, not proof of cheating.
 
-Just run: python "Scarf SS tool.py"
+Just run: python Scarf_SS_tool.py
 Missing dependencies (psutil) are installed automatically on first launch.
 
 Code layout: backend scanners first, then the GUI. Every table tab is built on
@@ -86,18 +86,57 @@ import string
 import struct
 import threading
 import winreg
+import zipfile
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_KEYWORDS = [
+# Keywords come in two tiers so a reviewer can tell a strong lead from noise:
+#   high     distinctive cheat module / client names that rarely appear by accident
+#   context  ordinary words that also show up in innocent software (Gradle
+#            "scaffold", the Scaffolding block, resource packs, anime skins...),
+#            so a hit only means "read the surrounding string before concluding".
+# In the keyword box, a line starting with "?" is a context keyword; anything
+# else is high.
+CONTEXT_PREFIX = "?"
+HIGH_KEYWORDS = [
     "killaura", "kill aura", "autoclicker", "auto clicker", "aimassist",
-    "aim assist", "triggerbot", "scaffold", "xray", "x-ray", "bhop",
-    "nofall", "antikb", "clickgui", "click gui", "wurst", "meteor client",
-    "impact client", "liquidbounce", "vape", "rise client", "sigma client",
-    "novoline", "astolfo", "doomsday", "dream client", "slinky",
+    "aim assist", "triggerbot", "nofall", "antikb", "clickgui", "click gui",
+    "wurst", "meteor client", "impact client", "liquidbounce", "rise client",
+    "sigma client", "novoline", "dream client",
 ]
+CONTEXT_KEYWORDS = [
+    "scaffold", "xray", "x-ray", "bhop", "vape", "slinky", "astolfo", "doomsday",
+]
+# Editable lines as shown in the keyword box.
+DEFAULT_KEYWORDS = HIGH_KEYWORDS + [CONTEXT_PREFIX + k for k in CONTEXT_KEYWORDS]
+
+SEVERITY_RANK = {"": 0, "context": 1, "high": 2}
+
+
+def parse_keyword_lines(lines):
+    """['killaura', '?scaffold', '# note'] -> {'killaura': 'high', 'scaffold': 'context'}.
+    If a word is listed in both tiers, high wins."""
+    tiers = {}
+    for raw in lines:
+        line = raw.strip().lower()
+        if not line or line.startswith("#"):
+            continue
+        tier = "high"
+        if line.startswith(CONTEXT_PREFIX):
+            tier, line = "context", line[len(CONTEXT_PREFIX):].strip()
+        if line and tiers.get(line) != "high":
+            tiers[line] = tier
+    return tiers
+
+
+def keyword_lines(tiers):
+    """Inverse of parse_keyword_lines (high first, then '?'-prefixed context ones)."""
+    high = sorted(k for k, t in tiers.items() if t == "high")
+    ctx = sorted(CONTEXT_PREFIX + k for k, t in tiers.items() if t != "high")
+    return high + ctx
+
 
 MC_NAME_HINTS = ("javaw", "java", "minecraft", "lunarclient", "lunar", "badlion")
 
@@ -708,9 +747,21 @@ def enumerate_installed_programs():
 HOSTS_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
                           r"System32\drivers\etc\hosts")
 LOOPBACK_IPS = {"0.0.0.0", "127.0.0.1", "::1", "::", "127.0.0.2"}
+# Specific names: a substring match is fine ("api.mojang.com", "easyanticheat.net").
 HOSTS_WATCH_HINTS = ("mojang", "minecraft", "microsoft", "xboxlive", "xbox", "hypixel",
-                     "anticheat", "anti-cheat", "easyanticheat", "battleye", "sentry",
-                     "telemetry", "report", "verify", "auth")
+                     "anticheat", "anti-cheat", "easyanticheat", "battleye")
+# Generic words: only count when they are a whole dot/hyphen-separated label, so
+# "auth.example.com" matches but "oauth.example.com" / "author.blog" do not.
+HOSTS_WEAK_HINTS = {"sentry", "telemetry", "report", "reports", "verify", "auth"}
+
+
+def hosts_note_for(host):
+    hl = host.lower()
+    if any(h in hl for h in HOSTS_WATCH_HINTS):
+        return "Minecraft / anti-cheat / auth related name"
+    if HOSTS_WEAK_HINTS & set(re.split(r"[.\-_]", hl)):
+        return "Generic auth/reporting-style name (weak match)"
+    return ""
 
 
 def parse_hosts_file(path=HOSTS_PATH):
@@ -744,9 +795,7 @@ def parse_hosts_file(path=HOSTS_PATH):
                 kind = "blocks (points to loopback)"
             else:
                 kind = "redirects to another IP"
-            note = ""
-            if kind != "default (localhost)" and any(h in hl for h in HOSTS_WATCH_HINTS):
-                note = "Minecraft / anti-cheat / auth related name"
+            note = hosts_note_for(host) if kind != "default (localhost)" else ""
             result["rows"].append({"line": lineno, "ip": ip, "host": host,
                                    "kind": kind, "note": note})
     return result
@@ -783,7 +832,14 @@ def get_default_client_roots():
     return roots
 
 
-def _walk_with_depth_limit(root, max_depth):
+# Big folders that never contain a mods folder or servers.dat. Skipping them
+# keeps the search fast on installs with large worlds / asset caches.
+HEAVY_DIRS = {"assets", "libraries", "saves", "runtime", "cache", "logs", "crash-reports",
+              "screenshots", "resourcepacks", "shaderpacks", "backups", "datapacks",
+              "node_modules", ".git", "versions"}
+
+
+def _walk_with_depth_limit(root, max_depth, prune=()):
     if not os.path.isdir(root):
         return
     root_depth = root.rstrip("\\/").count(os.sep)
@@ -791,19 +847,22 @@ def _walk_with_depth_limit(root, max_depth):
         depth = dirpath.rstrip("\\/").count(os.sep) - root_depth
         if depth >= max_depth:
             dirnames[:] = []
+        elif prune:
+            dirnames[:] = [d for d in dirnames if d.lower() not in prune]
         yield dirpath, dirnames, filenames
 
 
 def find_dirs_named(root, name, max_depth=6):
     name_l = name.lower()
-    return [dp for dp, _dn, _fn in _walk_with_depth_limit(root, max_depth)
+    prune = HEAVY_DIRS - {name_l}
+    return [dp for dp, _dn, _fn in _walk_with_depth_limit(root, max_depth, prune)
             if os.path.basename(dp).lower() == name_l]
 
 
 def find_files_named(root, filename, max_depth=6):
     name_l = filename.lower()
     found = []
-    for dirpath, _dn, filenames in _walk_with_depth_limit(root, max_depth):
+    for dirpath, _dn, filenames in _walk_with_depth_limit(root, max_depth, HEAVY_DIRS):
         for fn in filenames:
             if fn.lower() == name_l:
                 found.append(os.path.join(dirpath, fn))
@@ -813,7 +872,165 @@ def find_files_named(root, filename, max_depth=6):
 # ---------------------------------------------------------------------------
 # Mods folder scanning (profile/instance-aware)
 # ---------------------------------------------------------------------------
-HASH_SIZE_CAP = 20 * 1024 * 1024  # skip hashing anything bigger than this
+HASH_SIZE_CAP = 20 * 1024 * 1024      # mod jars bigger than this aren't hashed
+VERSION_HASH_CAP = 64 * 1024 * 1024   # game-version jars are bigger, allow more
+JAR_SUFFIXES = (".jar", ".jar.disabled")
+MODS_SUBFOLDER_DEPTH = 1              # also look in mods\<mc version>\ (Forge style)
+MAX_FLAG_WORDS = 6                    # keep the Flags column readable
+
+_SEP_RE = re.compile(r"[ _\-]+")
+
+
+def _norm(text):
+    """Lower-case and drop spaces/underscores/hyphens, so the keyword 'kill aura'
+    or 'x-ray' also matches a class called KillAura or X_Ray."""
+    return _SEP_RE.sub("", text.lower())
+
+
+def build_keyword_matcher(tiers):
+    """tiers: {keyword: 'high'|'context'} -> [(normalised, (keyword, tier)), ...]."""
+    best = {}
+    for kw, tier in tiers.items():
+        key = _norm(kw)
+        if key and (key not in best or tier == "high"):
+            best[key] = (kw, tier)
+    return list(best.items())
+
+
+def worst_tier(hits):
+    return max(hits.values(), key=lambda t: SEVERITY_RANK[t], default="")
+
+
+def format_flags(hits):
+    """{'killaura':'high','scaffold':'context'} -> 'HIGH: killaura | context: scaffold'."""
+    parts = []
+    for tier, label in (("high", "HIGH"), ("context", "context")):
+        words = sorted(k for k, t in hits.items() if t == tier)
+        if words:
+            more = f" +{len(words) - MAX_FLAG_WORDS}" if len(words) > MAX_FLAG_WORDS else ""
+            parts.append(f"{label}: {', '.join(words[:MAX_FLAG_WORDS])}{more}")
+    return " | ".join(parts)
+
+
+def _json_loads(raw):
+    try:
+        return json.loads(raw.decode("utf-8-sig", errors="ignore"), strict=False)
+    except ValueError:
+        return None
+
+
+_TOML_NAME_RE = re.compile(r"^\s*displayName\s*=\s*[\"']([^\"']+)[\"']", re.M)
+_TOML_ID_RE = re.compile(r"^\s*modId\s*=\s*[\"']([^\"']+)[\"']", re.M)
+
+
+def _read_member(zf, name, limit=256 * 1024):
+    try:
+        with zf.open(name) as f:
+            return f.read(limit)
+    except Exception:
+        return b""
+
+
+def read_jar_mod_names(zf, names):
+    """Mod name(s) the jar declares about itself (Fabric, Quilt, Forge/NeoForge).
+    Handy for spotting a jar whose file name says one thing and whose contents say another."""
+    lookup = {n.lower(): n for n in names}
+    found = []
+
+    raw = lookup.get("fabric.mod.json")
+    if raw:
+        data = _json_loads(_read_member(zf, raw))
+        if isinstance(data, dict):
+            found.append(data.get("name") or data.get("id"))
+
+    raw = lookup.get("quilt.mod.json")
+    if raw:
+        data = _json_loads(_read_member(zf, raw))
+        loader = data.get("quilt_loader") if isinstance(data, dict) else None
+        if isinstance(loader, dict):
+            meta = loader.get("metadata")
+            found.append((meta.get("name") if isinstance(meta, dict) else None) or loader.get("id"))
+
+    raw = lookup.get("mcmod.info")
+    if raw:
+        data = _json_loads(_read_member(zf, raw))
+        if isinstance(data, dict):
+            data = data.get("modList") or data.get("modlist")
+        if isinstance(data, list):
+            for item in data[:5]:
+                if isinstance(item, dict):
+                    found.append(item.get("name") or item.get("modid"))
+
+    for toml in ("meta-inf/mods.toml", "meta-inf/neoforge.mods.toml"):
+        raw = lookup.get(toml)
+        if raw:
+            text = _read_member(zf, raw).decode("utf-8", errors="ignore")
+            m = _TOML_NAME_RE.search(text) or _TOML_ID_RE.search(text)
+            if m:
+                found.append(m.group(1))
+
+    seen, out = set(), []
+    for n in found:
+        if isinstance(n, str) and n.strip() and n not in seen:
+            seen.add(n)
+            out.append(n.strip())
+    return out
+
+
+def inspect_jar(path, matcher, extra_text=()):
+    """Open a jar and report its declared mod name plus any keyword hits found in
+    entry names (class/package/resource paths), its file name, or its declared name.
+    Returns {'info', 'hits': {kw: tier}, 'evidence': str, 'note': str}."""
+    result = {"info": "", "hits": {}, "evidence": "", "note": ""}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            result["info"] = ", ".join(read_jar_mod_names(zf, names)[:3])
+    except Exception:
+        result["note"] = "not a readable jar/zip"
+        names = []
+    candidates = list(names) + [os.path.basename(path), result["info"], *extra_text]
+    blob = _norm("\x00".join(c for c in candidates if c))
+    hits = {kw: tier for key, (kw, tier) in matcher if key in blob}
+    result["hits"] = hits
+    evidence = []
+    for kw in sorted(hits, key=lambda k: (-SEVERITY_RANK[hits[k]], k)):
+        key = _norm(kw)
+        for cand in candidates:
+            if cand and key in _norm(cand):
+                evidence.append(f"{kw}: {cand}")
+                break
+        if len(evidence) >= 3:
+            break
+    result["evidence"] = "; ".join(evidence)
+    return result
+
+
+def _sha256_of(path, size, cap):
+    if size > cap:
+        return "(too large to hash)"
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def describe_jar(path, shown_name, matcher, kind="mod", hash_cap=HASH_SIZE_CAP, extra_text=()):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    info = inspect_jar(path, matcher, extra_text)
+    return {"kind": kind, "file": shown_name, "path": path, "size": st.st_size,
+            "modified": datetime.fromtimestamp(st.st_mtime),
+            "sha256": _sha256_of(path, st.st_size, hash_cap),
+            "info": info["info"] or info["note"],
+            "flags": format_flags(info["hits"]), "severity": worst_tier(info["hits"]),
+            "evidence": info["evidence"]}
 
 
 def find_mods_folders(root, max_depth=6):
@@ -831,57 +1048,111 @@ def profile_label_for(found_dir, root):
     return label
 
 
-def list_jars(mods_dir):
+def list_jars(mods_dir, matcher=(), subfolder_depth=MODS_SUBFOLDER_DEPTH):
+    """Every .jar / .jar.disabled in a mods folder, including one level of
+    subfolders (mods\\1.12.2\\foo.jar). Each row is a describe_jar() dict."""
     results = []
-    try:
-        entries = os.listdir(mods_dir)
-    except OSError:
-        return results
-    for fn in entries:
-        if not fn.lower().endswith((".jar", ".jar.disabled")):
-            continue
-        path = os.path.join(mods_dir, fn)
+    pending = [(mods_dir, 0)]
+    while pending:
+        folder, depth = pending.pop(0)
         try:
-            st = os.stat(path)
+            entries = sorted(os.listdir(folder))
         except OSError:
             continue
-        digest = ""
-        try:
-            if st.st_size <= HASH_SIZE_CAP:
-                h = hashlib.sha256()
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(65536), b""):
-                        h.update(chunk)
-                digest = h.hexdigest()
-            else:
-                digest = "(too large to hash)"
-        except OSError:
-            pass
-        results.append({"file": fn, "path": path, "size": st.st_size,
-                        "modified": datetime.fromtimestamp(st.st_mtime), "sha256": digest})
+        for fn in entries:
+            path = os.path.join(folder, fn)
+            if os.path.isdir(path):
+                if depth < subfolder_depth:
+                    pending.append((path, depth + 1))
+                continue
+            if not fn.lower().endswith(JAR_SUFFIXES):
+                continue
+            row = describe_jar(path, os.path.relpath(path, mods_dir), matcher)
+            if row:
+                results.append(row)
     return results
 
 
-def scan_mods(roots, stop=None, progress_cb=None):
-    """roots: [(label, path), ...]. Returns a flat list of jar rows, each
-    tagged with which launcher and profile/instance it came from."""
-    all_dirs = []
+def list_versions(versions_dir, matcher=()):
+    """One row per installed game version (versions\\<name>\\). Custom clients
+    often install as their own version, so the folder name, its jar contents and
+    its json's mainClass are all worth a look."""
+    results = []
+    try:
+        entries = sorted(os.listdir(versions_dir))
+    except OSError:
+        return results
+    for name in entries:
+        folder = os.path.join(versions_dir, name)
+        if not os.path.isdir(folder):
+            continue
+        meta = _json_loads(_read_file_head(os.path.join(folder, name + ".json")))
+        bits = []
+        if isinstance(meta, dict):
+            if meta.get("inheritsFrom"):
+                bits.append(f"inherits {meta['inheritsFrom']}")
+            if meta.get("mainClass"):
+                bits.append(str(meta["mainClass"]))
+        extra = [name, *bits]
+        jar = os.path.join(folder, name + ".jar")
+        if os.path.isfile(jar):
+            row = describe_jar(jar, name, matcher, kind="version",
+                               hash_cap=VERSION_HASH_CAP, extra_text=extra)
+            if row:
+                if bits:
+                    row["info"] = "; ".join(filter(None, [row["info"], *bits]))
+                results.append(row)
+            continue
+        # json-only version (e.g. a Fabric/Forge profile that reuses the vanilla jar)
+        text = _norm("\x00".join(extra))
+        hits = {kw: tier for key, (kw, tier) in matcher if key in text}
+        try:
+            mtime = datetime.fromtimestamp(os.stat(folder).st_mtime)
+        except OSError:
+            mtime = datetime.min
+        results.append({"kind": "version", "file": name, "path": folder, "size": 0,
+                        "modified": mtime, "sha256": "", "info": "; ".join(bits) or "(no jar)",
+                        "flags": format_flags(hits), "severity": worst_tier(hits),
+                        "evidence": "; ".join(f"{k}: {name}" for k in sorted(hits))[:200]})
+    return results
+
+
+def _read_file_head(path, limit=256 * 1024):
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit)
+    except OSError:
+        return b""
+
+
+def scan_mods(roots, tiers=None, include_versions=True, stop=None, progress_cb=None):
+    """roots: [(label, path), ...]; tiers: {keyword: 'high'|'context'}.
+    Returns a flat list of rows, flagged ones first, each tagged with its
+    launcher and profile/instance."""
+    matcher = build_keyword_matcher(tiers or {})
+    jobs = []
     for label, root in roots:
         for mdir in find_mods_folders(root):
-            all_dirs.append((label, root, mdir))
-    total = len(all_dirs) or 1
+            jobs.append(("mods", label, root, mdir))
+        if include_versions:
+            for vdir in find_dirs_named(root, "versions"):
+                jobs.append(("versions", label, root, vdir))
+    total = len(jobs) or 1
     rows = []
-    for i, (label, root, mdir) in enumerate(all_dirs):
+    for i, (kind, label, root, folder) in enumerate(jobs):
         if stop is not None and stop.is_set():
             break
-        profile = profile_label_for(mdir, root)
-        for jar in list_jars(mdir):
-            jar["launcher"] = label
-            jar["profile"] = profile
-            jar["mods_dir"] = mdir
-            rows.append(jar)
+        profile = profile_label_for(folder, root)
+        found = list_jars(folder, matcher) if kind == "mods" else list_versions(folder, matcher)
+        for row in found:
+            row["launcher"] = label
+            row["profile"] = profile
+            row["mods_dir"] = folder
+            rows.append(row)
         if progress_cb:
             progress_cb((i + 1) * 100 / total)
+    rows.sort(key=lambda r: (-SEVERITY_RANK[r["severity"]], r["launcher"].lower(),
+                             r["profile"].lower(), r["kind"], r["file"].lower()))
     return rows
 
 
@@ -1027,7 +1298,9 @@ DEFAULT_LOG_PATH_SUFFIXES = [
 LOG_LINE_PATTERNS = [
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16}) joined the game"),
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16}) left the game"),
-    re.compile(r"<(?P<name>[A-Za-z0-9_]{3,16})>"),
+    # Chat only, so stack-trace tokens like <init> / <clinit> aren't read as players.
+    # Handles "[CHAT] <Name>", "[CHAT] [Not Secure] <Name>" and singleplayer "INFO]: <Name>".
+    re.compile(r"(?:\[CHAT\]|INFO\]:)\s*(?:\[[^\]<]*\]\s*)*<(?P<name>[A-Za-z0-9_]{3,16})>"),
     re.compile(r"UUID of player (?P<name>[A-Za-z0-9_]{3,16}) is"),
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16})\[/[\d.]+:\d+\] logged in"),
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16}) has (?:made the advancement|"
@@ -1054,16 +1327,33 @@ def is_valid_username(name):
 
 
 def extract_matches(line):
-    """Return [(username, time_str), ...] found in one log line."""
+    """Return the usernames found in one log line."""
     out = []
     for pat in LOG_LINE_PATTERNS:
         m = pat.search(line)
-        if m:
-            name = m.group("name")
-            if is_valid_username(name):
-                tm = TIME_PREFIX_RE.match(line)
-                out.append((name, tm.group(1) if tm else ""))
+        if m and is_valid_username(m.group("name")):
+            out.append(m.group("name"))
     return out
+
+
+LOG_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def log_file_date(path):
+    """'YYYY-MM-DD' for a log file: from its name (2025-03-01-2.log.gz), otherwise
+    from its modified time (latest.log and client-specific names)."""
+    m = LOG_DATE_RE.match(os.path.basename(path))
+    if m:
+        return m.group(1)
+    mt = _safe_mtime(path)
+    return datetime.fromtimestamp(mt).strftime("%Y-%m-%d") if mt else ""
 
 
 def iter_log_files(root):
@@ -1090,38 +1380,47 @@ def read_log_lines(path):
 
 
 def scan_logs(paths, stop=None, progress_cb=None):
-    """Scan every log file under the given paths.
+    """Scan every log file under the given paths, oldest first.
 
-    Returns (agg, local_names):
+    Returns (agg, local_accounts):
       agg: {username: {count, files, first_time, sample}} for every name seen
-           joining, leaving, chatting, etc.
-      local_names: usernames the log itself says launched the game session
-                   (from "Setting user: ..." lines) - i.e. likely the PC
-                   owner, not someone they were talking to.
+           joining, leaving, chatting, etc. ("first_time" is 'YYYY-MM-DD HH:MM:SS').
+      local_accounts: {username: {sessions, files, first_seen, last_seen}} for
+           every account the logs say launched the game ("Setting user: ..."
+           lines). These are the accounts used on THIS PC, so more than one name
+           here is the strongest alt signal the logs offer.
     """
-    agg = {}
-    local_names = set()
-    files = []
+    agg, local_accounts = {}, {}
+    files = set()
     for p in paths:
-        files.extend(iter_log_files(p))
+        files.update(iter_log_files(p))
+    files = sorted(files, key=lambda f: (log_file_date(f), _safe_mtime(f)))
     total = len(files) or 1
     for i, path in enumerate(files):
         if stop is not None and stop.is_set():
             break
+        day = log_file_date(path)
+        base = os.path.basename(path)
         for line in read_log_lines(path):
+            tm = TIME_PREFIX_RE.match(line)
+            stamp = f"{day} {tm.group(1)}".strip() if tm else day
             su = SETTING_USER_RE.search(line)
             if su and is_valid_username(su.group("name")):
-                local_names.add(su.group("name"))
-            for name, t in extract_matches(line):
+                acct = local_accounts.setdefault(
+                    su.group("name"),
+                    {"sessions": 0, "files": set(), "first_seen": stamp, "last_seen": stamp})
+                acct["sessions"] += 1
+                acct["files"].add(base)
+                acct["last_seen"] = stamp      # files are processed oldest-first
+            for name in extract_matches(line):
                 entry = agg.setdefault(
-                    name, {"count": 0, "files": set(), "first_time": t, "sample": line.strip()})
+                    name, {"count": 0, "files": set(), "first_time": stamp,
+                           "sample": line.strip()})
                 entry["count"] += 1
-                entry["files"].add(os.path.basename(path))
-                if not entry["first_time"] and t:
-                    entry["first_time"] = t
+                entry["files"].add(base)
         if progress_cb:
             progress_cb((i + 1) * 100 / total)
-    return agg, local_names
+    return agg, local_accounts
 
 
 # ---------------------------------------------------------------------------
@@ -1139,8 +1438,8 @@ def _is_sensitive(key, value):
     kl = key.lower()
     if any(h in kl for h in SENSITIVE_KEY_HINTS):
         return True
-    if isinstance(value, str) and len(value) > 60:
-        return True
+    if isinstance(value, str) and (len(value) > 60 or "@" in value):
+        return True      # long = token-shaped; "@" = an email address, not a player name
     return False
 
 
@@ -1170,14 +1469,36 @@ def _walk_json_for_names(obj, names):
 
 def scan_account_file(path):
     """Return the set of profile/display names found in one launcher JSON file.
-    Never returns tokens, secrets, or other credential-shaped values."""
+    Never returns tokens, secrets, e-mail addresses or other credential-shaped values.
+
+    launcher_accounts.json and launcher_profiles.json get dedicated handling because
+    their generic "username" / "name" keys are an e-mail address and a version
+    profile name respectively - neither is a player name."""
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
     except Exception:
         return set()
     names = set()
-    _walk_json_for_names(data, names)
+    base = os.path.basename(path).lower()
+
+    def add(value):
+        if isinstance(value, str) and value and not _is_sensitive("name", value):
+            names.add(value)
+
+    if base == "launcher_accounts.json" and isinstance(data, dict):
+        accounts = data.get("accounts")
+        for acct in (accounts.values() if isinstance(accounts, dict) else []):
+            profile = acct.get("minecraftProfile") if isinstance(acct, dict) else None
+            if isinstance(profile, dict):
+                add(profile.get("name"))
+    elif base == "launcher_profiles.json" and isinstance(data, dict):
+        db = data.get("authenticationDatabase")
+        for acct in (db.values() if isinstance(db, dict) else []):
+            if isinstance(acct, dict):
+                add(acct.get("displayName"))
+    else:
+        _walk_json_for_names(data, names)
     return names
 
 
@@ -1503,8 +1824,12 @@ class TableTab(ttk.Frame):
         f = self.current_filter()
         return [r for r in self.rows if self.is_visible(r, f)]
 
+    def row_tags(self, row):
+        """Treeview tags for a row: 'high' / 'context' colour it (see _apply_theme)."""
+        return ()
+
     def insert_row(self, row):
-        self.tree.insert("", "end", values=self.row_values(row))
+        self.tree.insert("", "end", values=self.row_values(row), tags=self.row_tags(row))
 
     def apply_filter(self):
         self.tree.delete(*self.tree.get_children())
@@ -1640,6 +1965,9 @@ class ScanTab(TableTab):
 # more of the ScanTab/TableTab behaviour than the others do)
 # ---------------------------------------------------------------------------
 class MemoryScanTab(TableTab):
+    NOTE = ("Red = a distinctive cheat/client name. Amber = a common word that also appears in "
+            "innocent software - read the string before reading into it. Start a keyword line "
+            "with ? to make it amber.")
     COLUMNS = (("time", "Time", 70), ("pid", "Pid", 60), ("address", "Address", 140),
                ("enc", "Enc", 55), ("keyword", "Keyword", 120), ("string", "String", 600))
     STRETCH = "string"
@@ -1651,6 +1979,7 @@ class MemoryScanTab(TableTab):
         self.q = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
+        self.kw_tiers = {}          # keyword -> 'high' | 'context', set when a scan starts
 
     def after_build(self):
         self.procs.refresh()
@@ -1678,7 +2007,7 @@ class MemoryScanTab(TableTab):
             ttk.Button(of, text="Run as admin", command=lambda: offer_admin_restart(self)
                        ).grid(row=2, column=1, pady=(6, 0))
 
-        kf = ttk.LabelFrame(top, text="Keywords (one per line, case-insensitive)", padding=8)
+        kf = ttk.LabelFrame(top, text="Keywords (one per line; ? prefix = needs context)", padding=8)
         kf.pack(side="left", fill="both", expand=True)
         self.kw_text = tk.Text(kf, height=6, width=30)
         self.kw_text.pack(side="left", fill="both", expand=True)
@@ -1706,9 +2035,16 @@ class MemoryScanTab(TableTab):
         self.detail.pack(fill="x", pady=(8, 0))
 
     # ---- rows are plain tuples here ---------------------------------------
+    def _tier(self, kw):
+        return self.kw_tiers.get(kw, "high")
+
     def row_values(self, row):
         time_, pid, addr, enc, kw, text = row
-        return (time_, pid, addr, enc, kw, text[:300])
+        label = f"{kw} (context)" if self._tier(kw) == "context" else kw
+        return (time_, pid, addr, enc, label, text[:300])
+
+    def row_tags(self, row):
+        return (self._tier(row[4]),)
 
     def search_text(self, row):
         return " ".join(str(v) for v in row).lower()
@@ -1718,8 +2054,8 @@ class MemoryScanTab(TableTab):
 
     # ---- keywords ----------------------------------------------------------
     def get_keywords(self):
-        lines = self.kw_text.get("1.0", "end").splitlines()
-        return [ln.strip().lower() for ln in lines if ln.strip() and not ln.startswith("#")]
+        """{keyword: 'high'|'context'} from the keyword box."""
+        return parse_keyword_lines(self.kw_text.get("1.0", "end").splitlines())
 
     def load_keywords(self):
         path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All", "*.*")])
@@ -1733,7 +2069,7 @@ class MemoryScanTab(TableTab):
                                             filetypes=[("Text files", "*.txt")])
         if path:
             with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(self.get_keywords()))
+                f.write("\n".join(keyword_lines(self.get_keywords())))
 
     def reset_keywords(self):
         self.kw_text.delete("1.0", "end")
@@ -1760,7 +2096,9 @@ class MemoryScanTab(TableTab):
             min_len = max(3, int(self.min_len.get()))
         except (ValueError, tk.TclError):
             min_len = 5
-        kw_regex = (re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE)
+        self.kw_tiers = keywords
+        kw_regex = (re.compile("|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)),
+                               re.IGNORECASE)
                     if keywords else None)
 
         self.stop_event.clear()
@@ -1838,7 +2176,7 @@ class MemoryScanTab(TableTab):
             row = visible[idx]
             self.detail.config(state="normal")
             self.detail.delete("1.0", "end")
-            self.detail.insert("1.0", f"{row[2]} [{row[3]}] kw='{row[4]}'\n{row[5]}")
+            self.detail.insert("1.0", f"{row[2]} [{row[3]}] kw='{row[4]}' ({self._tier(row[4])})\n{row[5]}")
             self.detail.config(state="disabled")
 
     def clear_results(self):
@@ -1850,13 +2188,14 @@ class MemoryScanTab(TableTab):
         with open(path, "w", encoding="utf-8", newline="") as f:
             if path.lower().endswith(".csv"):
                 w = csv.writer(f)
-                w.writerow(self.EXPORT_HEADER)
-                w.writerows(self.rows)
+                w.writerow(self.EXPORT_HEADER + ["level"])
+                w.writerows(list(r) + [self._tier(r[4])] for r in self.rows)
             else:
                 f.write(f"# SS string log - {datetime.now().isoformat()}\n")
-                f.write("# Matches are leads to review, not proof of cheating.\n\n")
+                f.write("# Matches are leads to review, not proof of cheating.\n")
+                f.write("# 'context' = common word that also appears in innocent software.\n\n")
                 for t, pid, addr, enc, kw, text in self.rows:
-                    f.write(f"[{t}] PID {pid} {addr} [{enc}] kw='{kw}' :: {text}\n")
+                    f.write(f"[{t}] PID {pid} {addr} [{enc}] kw='{kw}' ({self._tier(kw)}) :: {text}\n")
 
     def export(self):
         if not self.rows:
@@ -2020,48 +2359,124 @@ class PrefetchTab(ScanTab):
 # Mods Scanner tab
 # ---------------------------------------------------------------------------
 class ModsScannerTab(ScanTab):
-    NOTE = ("Finds every \"mods\" folder under each launcher's data folder, "
-            "including profile/instance-based launchers like CurseForge, "
-            "Modrinth App, and Dawn where each instance keeps its own mods "
-            "folder rather than one global one. Lists each jar with a SHA-256 "
-            "hash (skipped for files over 20 MB) so you can compare against "
-            "known-bad hashes if you keep a list.")
-    COLUMNS = (("launcher", "Launcher", 130), ("profile", "Profile/instance", 150),
-               ("file", "File", 220), ("size", "Size (bytes)", 90),
-               ("modified", "Modified", 140), ("sha256", "SHA-256", 280))
+    NOTE = ("Finds every \"mods\" folder under each launcher's data folder (including per-profile "
+            "ones like CurseForge, Modrinth App and Dawn, and one level of subfolders such as "
+            "mods\\1.12.2) and, optionally, the installed game versions. Each jar is opened and "
+            "its class/package/resource names, file name and declared mod name are checked "
+            "against the Memory Scan keyword list, so a renamed cheat is still caught. Red = "
+            "distinctive cheat name, amber = common word (check the evidence in the box below). "
+            "Hashes are skipped for mods over 20 MB (64 MB for game versions).")
+    COLUMNS = (("flags", "Flags", 150), ("file", "File / version", 190),
+               ("info", "Declared name / info", 150), ("kind", "Kind", 55),
+               ("launcher", "Launcher", 100), ("profile", "Profile/instance", 110),
+               ("size", "Size (bytes)", 80), ("modified", "Modified", 125),
+               ("sha256", "SHA-256", 200))
     STRETCH = "sha256"
-    SEARCH_KEYS = ("file", "profile", "launcher")
-    EXPORT_HEADER = ["launcher", "profile", "file", "size_bytes", "modified", "sha256", "full_path"]
+    SEARCH_KEYS = ("flags", "file", "info", "kind", "profile", "launcher")
+    EXPORT_HEADER = ["flags", "kind", "launcher", "profile", "file", "declared_name_or_info",
+                     "size_bytes", "modified", "sha256", "evidence", "full_path"]
     SCAN_LABEL = "Scan mods"
-    BUSY_TEXT = "Scanning for mods folders..."
+    BUSY_TEXT = "Scanning for mods folders and opening jars..."
     ERROR_TITLE = "Mods scan failed"
     HAS_PROGRESS = True
+    SORTABLE = True
+
+    def init_state(self):
+        super().init_state()
+        self.keyword_count = 0
 
     def build_top(self):
         self.picker = add_path_picker(
             self, "Search locations", defaults=get_default_client_roots(),
             default_caption="Default launcher folders (unchecked ones weren't found):",
             custom_caption="Custom launcher/instance folder:")
+        opt = ttk.Frame(self)
+        opt.pack(fill="x", pady=(8, 0))
+        self.include_versions = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="Also list installed game versions (the versions folder)",
+                        variable=self.include_versions).pack(anchor="w")
+        row = ttk.Frame(opt)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="Extra keywords for this scan (comma-separated, ? prefix = needs context):"
+                  ).pack(side="left")
+        self.extra_kw = tk.StringVar()
+        ttk.Entry(row, textvariable=self.extra_kw, width=40).pack(side="left", padx=6)
+
+    def build_after_table(self):
+        self.tree.bind("<<TreeviewSelect>>", self.show_detail)
+        self.detail = tk.Text(self, height=4, wrap="word", state="disabled")
+        self.detail.pack(fill="x", pady=(8, 0))
+
+    def _keyword_tiers(self):
+        """Use the Memory Scan tab's (possibly edited) keyword box so there is one list
+        to maintain; fall back to the defaults. Extra keywords are added on top."""
+        tiers = parse_keyword_lines(DEFAULT_KEYWORDS)
+        mem = getattr(self.winfo_toplevel(), "tabs", {}).get("Memory Scan")
+        if mem is not None:
+            tiers = mem.get_keywords() or tiers
+        for kw, tier in parse_keyword_lines(self.extra_kw.get().split(",")).items():
+            if tiers.get(kw) != "high":
+                tiers[kw] = tier
+        return tiers
 
     def prepare_scan(self):
         roots = self.picker.selected()
         if not roots:
             messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
             return None
-        return (roots,)
+        return (roots, self._keyword_tiers(), self.include_versions.get())
 
-    def scan(self, roots):
-        return scan_mods(roots, self.stop_event, self.report_progress)
+    def scan(self, roots, tiers, include_versions):
+        self.keyword_count = len(tiers)
+        return scan_mods(roots, tiers, include_versions, self.stop_event, self.report_progress)
 
     def done_message(self, rows):
-        return f"Found {len(rows)} mod jar(s)."
+        high = sum(1 for r in rows if r["severity"] == "high")
+        ctx = sum(1 for r in rows if r["severity"] == "context")
+        mods = sum(1 for r in rows if r["kind"] == "mod")
+        return (f"Found {mods} mod jar(s) and {len(rows) - mods} game version(s); "
+                f"{high} flagged red, {ctx} amber ({self.keyword_count} keywords checked).")
 
     def row_values(self, m):
-        return (m["launcher"], m["profile"], m["file"], m["size"], fmt_dt(m["modified"]), m["sha256"])
+        return (m["flags"], m["file"], m["info"], m["kind"], m["launcher"], m["profile"],
+                m["size"], fmt_dt(m["modified"]), m["sha256"])
+
+    def row_tags(self, m):
+        return (m["severity"],) if m["severity"] else ()
 
     def export_row(self, m):
-        return [m["launcher"], m["profile"], m["file"], m["size"],
-                fmt_dt(m["modified"]), m["sha256"], m["path"]]
+        return [m["flags"], m["kind"], m["launcher"], m["profile"], m["file"], m["info"],
+                m["size"], fmt_dt(m["modified"]), m["sha256"], m["evidence"], m["path"]]
+
+    def sort_key(self, r, col):
+        if col == "flags":
+            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
+        if col == "size":
+            return r["size"]
+        if col == "modified":
+            return r["modified"]
+        return str(r.get(col, "")).lower()
+
+    def sort_starts_descending(self, col):
+        return col in ("flags", "size", "modified")
+
+    def show_detail(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        visible = self.visible_rows()
+        idx = self.tree.index(sel[0])
+        if idx >= len(visible):
+            return
+        m = visible[idx]
+        text = (f"{m['path']}\n"
+                f"Flags: {m['flags'] or 'none'}\n"
+                f"Evidence: {m['evidence'] or '-'}\n"
+                f"SHA-256: {m['sha256'] or '-'}")
+        self.detail.config(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("1.0", text)
+        self.detail.config(state="disabled")
 
 
 # ---------------------------------------------------------------------------
@@ -2329,16 +2744,18 @@ class ProcessTimelineTab(TableTab):
 class LogsPanel(ScanTab):
     NOTE = ("Scans Minecraft-style log files for usernames seen joining, "
             "leaving, or chatting, and lists each unique one under Possible "
-            "Alts below. This only reads log files already on disk. Your own "
-            "username (from \"Setting user: ...\" lines) is auto-detected and "
-            "excluded, so chat lines from you aren't mistaken for an alt.")
+            "Alts below. This only reads log files already on disk. The lower table "
+            "lists every account the logs say LAUNCHED the game on this PC "
+            "(\"Setting user: ...\" lines) - several names there is the strongest alt "
+            "signal here. The upper table is only players seen online, which is a much "
+            "weaker signal, so by default the launching accounts are hidden from it.")
     COLUMNS = (("username", "Username", 150), ("likely_you", "Likely you?", 80),
                ("count", "Occurrences", 80), ("files", "Seen in file(s)", 200),
-               ("first_time", "First match time", 100), ("sample", "Sample log line", 360))
+               ("first_time", "First seen", 130), ("sample", "Sample log line", 330))
     STRETCH = "sample"
-    EXPORT_HEADER = ["username", "likely_you", "occurrences", "files", "first_time", "sample_line"]
+    EXPORT_HEADER = ["username", "likely_you", "occurrences", "files", "first_seen", "sample_line"]
     PADDING = 0
-    TABLE_TITLE = "Possible alts (other players seen in logs)"
+    TABLE_TITLE = "Players seen in logs (weak signal - launching accounts are listed below)"
     TABLE_HEIGHT = 260
     SCAN_LABEL = "Scan logs"
     BUSY_TEXT = "Scanning log files..."
@@ -2347,8 +2764,9 @@ class LogsPanel(ScanTab):
 
     def init_state(self):
         super().init_state()
+        self.local_accounts = {}            # accounts that launched the game (shown below)
         self.local_names = set()            # names shown as "likely you"
-        self.pending_local_names = set()    # set by the worker, applied in on_scan_done
+        self.pending_local_accounts = {}    # set by the worker, applied in on_scan_done
 
     def build_top(self):
         self.picker = add_path_picker(
@@ -2365,12 +2783,52 @@ class LogsPanel(ScanTab):
         self.exclude_var.trace_add("write", lambda *_: self.apply_filter())
         ttk.Entry(ef, textvariable=self.exclude_var, width=60).pack(fill="x")
         self.auto_exclude_local = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ef, text="Auto-exclude detected local account name(s) - see below",
+        ttk.Checkbutton(ef, text="Hide the launching account(s) from the players table above",
                         variable=self.auto_exclude_local,
                         command=self.apply_filter).pack(anchor="w", pady=(4, 0))
-        self.local_names_label = ttk.Label(ef, text="Detected local account(s): none yet (scan first)",
+        self.local_names_label = ttk.Label(ef, text="Launching accounts: none yet (scan first)",
                                            foreground="gray")
         self.local_names_label.pack(anchor="w")
+
+    ACCOUNT_COLUMNS = (("account", "Account", 170), ("sessions", "Launches", 70),
+                       ("first_seen", "First seen", 140), ("last_seen", "Last seen", 140),
+                       ("files", "Seen in file(s)", 300))
+
+    def build_after_table(self):
+        box = ttk.LabelFrame(
+            self, padding=4,
+            text="Accounts that launched the game on this PC (several = likely alts)")
+        box.pack(fill="x", pady=(8, 0))
+        inner = ttk.Frame(box)
+        inner.pack(fill="x")
+        keys = [c[0] for c in self.ACCOUNT_COLUMNS]
+        self.acct_tree = ttk.Treeview(inner, columns=keys, show="headings", height=5,
+                                      selectmode="browse")
+        for key, heading, width in self.ACCOUNT_COLUMNS:
+            self.acct_tree.heading(key, text=heading)
+            self.acct_tree.column(key, width=width, anchor="w", stretch=(key == "files"))
+        sb = ttk.Scrollbar(inner, orient="vertical", command=self.acct_tree.yview)
+        self.acct_tree.configure(yscrollcommand=sb.set)
+        self.acct_tree.pack(side="left", fill="x", expand=True)
+        sb.pack(side="left", fill="y")
+        ttk.Button(box, text="Export accounts...", command=self.export_accounts
+                   ).pack(anchor="w", pady=(4, 0))
+
+    def _account_rows(self):
+        return [(name, a["sessions"], a["first_seen"], a["last_seen"],
+                 ", ".join(sorted(a["files"])))
+                for name, a in sorted(self.local_accounts.items(),
+                                      key=lambda kv: kv[1]["first_seen"])]
+
+    def export_accounts(self):
+        rows = self._account_rows()
+        if not rows:
+            messagebox.showinfo("Export", "No launching accounts found yet. Scan logs first.")
+            return
+        path = ask_csv_path()
+        if path:
+            write_csv(path, ["account", "launches", "first_seen", "last_seen", "files"], rows)
+            self.set_status(f"Exported {len(rows)} account(s) to {path}")
 
     # ---- scanning ----------------------------------------------------------
     def prepare_scan(self):
@@ -2381,26 +2839,35 @@ class LogsPanel(ScanTab):
         return (paths,)
 
     def scan(self, paths):
-        self.pending_local_names = set()
-        agg, local_names = scan_logs(paths, self.stop_event, self.report_progress)
-        self.pending_local_names = local_names
+        self.pending_local_accounts = {}
+        agg, local_accounts = scan_logs(paths, self.stop_event, self.report_progress)
+        self.pending_local_accounts = local_accounts
         rows = [{"name": name, **info} for name, info in agg.items()]
         rows.sort(key=lambda r: -r["count"])
         return rows
 
     def on_scan_done(self, rows):
-        self.local_names = self.pending_local_names
+        self.local_accounts = self.pending_local_accounts
+        self.local_names = set(self.local_accounts)
+        self.acct_tree.delete(*self.acct_tree.get_children())
+        for values in self._account_rows():
+            self.acct_tree.insert("", "end", values=values)
         if self.local_names:
+            normal_fg = ttk.Style(self).lookup("TLabel", "foreground") or "black"
             self.local_names_label.config(
-                text="Detected local account(s): " + ", ".join(sorted(self.local_names)),
-                foreground="black")
+                text="Launching account(s): " + ", ".join(sorted(self.local_names)),
+                foreground=normal_fg)
         else:
             self.local_names_label.config(
-                text="Detected local account(s): none found (no \"Setting user:\" line in these logs)",
+                text="Launching accounts: none found (no \"Setting user:\" line in these logs)",
                 foreground="gray")
 
     def done_message(self, rows):
-        return f"Found {len(rows)} unique username(s) across the scanned logs."
+        n = len(self.local_names)
+        msg = f"Found {len(rows)} unique username(s) across the scanned logs. "
+        if n > 1:
+            return msg + f"{n} different accounts launched the game on this PC - worth a look."
+        return msg + f"{plural(n, 'account', 'accounts')} launched the game here."
 
     # ---- filtering / display ----------------------------------------------
     def _excluded_set(self):
@@ -2434,9 +2901,9 @@ class LogsPanel(ScanTab):
 class AccountsPanel(ScanTab):
     NOTE = ("Reads profile/display names out of launcher account files already "
             "on this PC - i.e. which accounts are logged into which launcher. "
-            "Only names are shown; access tokens, passwords, and other "
-            "credential-looking values are never read out, whatever the file "
-            "contains.")
+            "Only player names are shown; access tokens, passwords, e-mail "
+            "addresses and other credential-looking values are never read out, "
+            "whatever the file contains.")
     COLUMNS = (("source", "Launcher file", 480), ("name", "Profile / display name", 260))
     STRETCH = "source"
     EXPORT_HEADER = ["source_file", "profile_name"]
@@ -2524,9 +2991,9 @@ class CreditsTab(ttk.Frame):
 # Main App
 # ---------------------------------------------------------------------------
 LIGHT_COLORS = dict(bg="#f0f0f0", fg="#000000", field_bg="#ffffff", select="#3399ff",
-                    select_fg="#ffffff")
+                    select_fg="#ffffff", high="#c62828", context="#a15c00")
 DARK_COLORS = dict(bg="#1e1e1e", fg="#e6e6e6", field_bg="#2b2b2b", select="#3a6ea5",
-                   select_fg="#ffffff")
+                   select_fg="#ffffff", high="#ff6b6b", context="#e0a030")
 
 # (tab title, tab class) in display order - add a new tab by adding a line here.
 TABS = [
@@ -2637,6 +3104,9 @@ class App(tk.Tk):
                                     highlightthickness=0)
                 elif isinstance(child, tk.Canvas):
                     child.configure(bg=c["bg"])
+                elif isinstance(child, ttk.Treeview):    # severity colours for flagged rows
+                    child.tag_configure("high", foreground=c["high"])
+                    child.tag_configure("context", foreground=c["context"])
             except tk.TclError:
                 pass
             self._recolor_classic_widgets(child, c)
