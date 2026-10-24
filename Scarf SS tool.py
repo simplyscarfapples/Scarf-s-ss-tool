@@ -1,20 +1,28 @@
 """
-Minecraft SS String Logger - GUI (Windows)
+Scarf's SS Tool - Minecraft screenshare helper GUI (Windows)
 
 Tabs:
   - Memory Scan:        scans a running process's memory for keyword strings
+  - DLL Scanner:        lists DLLs loaded into a process
+  - Log Checker:        usernames seen in logs (possible alts) + launcher accounts
+  - Mods Scanner:       finds mods folders and hashes jars
+  - Servers:            saved servers from servers.dat
   - Recycle Bin:        reads $Recycle.Bin metadata for deleted-file history
-  - Prefetch:           reads C:\\Windows\\Prefetch entries (program run history)
+  - Prefetch:           reads C:\\Windows\\Prefetch (program run history, incl. Win10/11)
+  - Installed Programs: registry uninstall entries, including leftovers
+  - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
-                         (e.g. after Minecraft launched)
 
 Built for VISIBLE use during a screenshare the other person has agreed to.
 Everything here reads artifacts already on disk or live process metadata;
 nothing here captures keystrokes or runs hidden/in the background.
 A match or entry is a lead to review, not proof of cheating.
 
-Just run:  python mc_string_logger_gui.py
+Just run: python "Scarf SS tool.py"
 Missing dependencies (psutil) are installed automatically on first launch.
+
+Code layout: backend scanners first, then the GUI. Every table tab is built on
+the TableTab / ScanTab base classes - see the "GUI" section for how to add one.
 """
 
 import sys
@@ -78,7 +86,7 @@ import string
 import struct
 import threading
 import winreg
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -173,13 +181,14 @@ def relaunch_as_admin():
 
 
 def filetime_to_datetime(ft):
-    """Convert a Windows FILETIME (100ns ticks since 1601-01-01) to datetime."""
+    """Convert a Windows FILETIME (100ns ticks since 1601-01-01, UTC) to a local datetime."""
     if not ft:
         return None
     EPOCH_AS_FILETIME = 116444736000000000
     HUNDREDS_OF_NS = 10_000_000
     try:
-        return datetime(1970, 1, 1) + timedelta(seconds=(ft - EPOCH_AS_FILETIME) / HUNDREDS_OF_NS)
+        # fromtimestamp() gives local time, matching every other timestamp in the tool
+        return datetime.fromtimestamp((ft - EPOCH_AS_FILETIME) / HUNDREDS_OF_NS)
     except (OverflowError, OSError, ValueError):
         return None
 
@@ -411,26 +420,132 @@ def enumerate_recycle_bin(stop=None):
 # Prefetch history
 # ---------------------------------------------------------------------------
 PREFETCH_DIR = r"C:\Windows\Prefetch"
-# Best-effort, version-specific offsets for the run-count field in UNCOMPRESSED
-# prefetch files. These are not guaranteed accurate on every Windows build;
-# Windows 10/11 prefetch files are MAM-compressed and are reported as such
-# instead of being parsed.
-RUN_COUNT_OFFSETS = {17: 0x90, 23: 0xD0, 26: 0xD0}
+
+# Windows 10/11 compress every .pf file ("MAM" header, XPRESS-Huffman payload).
+# We decompress them with ntdll's RtlDecompressBufferEx - the same routine
+# Windows itself uses - then parse the normal "SCCA" prefetch format inside.
+MAM_SIGNATURE = b"MAM\x04"
+COMPRESSION_FORMAT_XPRESS_HUFF = 0x0004
+MAX_PF_UNCOMPRESSED = 64 * 1024 * 1024        # sanity cap; real files are < 1 MB
+
+# SCCA format version -> human-readable Windows release
+PF_VERSIONS = {17: "XP/2003", 23: "Vista/7", 26: "8/8.1", 30: "10", 31: "11"}
+
+# Offsets of the "last run time" FILETIME array inside the decompressed file,
+# and how many slots it has (Win8+ keeps the 8 most recent runs).
+PF_RUN_TIMES = {17: (120, 1), 23: (128, 1), 26: (128, 8), 30: (128, 8), 31: (128, 8)}
+
+# Candidate offsets of the run-count field. Windows 10 ships two slightly
+# different layouts, so for those we try both and keep whichever is consistent
+# with the run-time array (see _pick_run_count).
+PF_RUN_COUNT_OFFSETS = {17: (144,), 23: (152,), 26: (208,), 30: (208, 200), 31: (208, 200)}
+
+_ntdll = None
 
 
-def try_parse_run_count(path, version):
-    off = RUN_COUNT_OFFSETS.get(version)
-    if off is None:
-        return None
-    try:
-        with open(path, "rb") as f:
-            f.seek(off)
-            raw = f.read(4)
-        if len(raw) == 4:
-            return int.from_bytes(raw, "little")
-    except Exception:
-        pass
-    return None
+def _get_ntdll():
+    """Load ntdll once and declare the two compression routines we use."""
+    global _ntdll
+    if _ntdll is None:
+        nt = ctypes.WinDLL("ntdll")
+        nt.RtlGetCompressionWorkSpaceSize.argtypes = [
+            wt.USHORT, ctypes.POINTER(wt.ULONG), ctypes.POINTER(wt.ULONG)]
+        nt.RtlGetCompressionWorkSpaceSize.restype = ctypes.c_long
+        nt.RtlDecompressBufferEx.argtypes = [
+            wt.USHORT, ctypes.c_void_p, wt.ULONG, ctypes.c_void_p, wt.ULONG,
+            ctypes.POINTER(wt.ULONG), ctypes.c_void_p]
+        nt.RtlDecompressBufferEx.restype = ctypes.c_long
+        _ntdll = nt
+    return _ntdll
+
+
+def decompress_mam(raw):
+    """Decompress a Windows 10/11 prefetch file (MAM header) to plain SCCA bytes.
+    Raises ValueError / OSError if the data can't be decompressed."""
+    if raw[:4] != MAM_SIGNATURE or len(raw) < 8:
+        raise ValueError("not a MAM-compressed file")
+    out_size = int.from_bytes(raw[4:8], "little")
+    if not 0 < out_size <= MAX_PF_UNCOMPRESSED:
+        raise ValueError(f"implausible uncompressed size ({out_size})")
+    payload = raw[8:]
+    nt = _get_ntdll()
+
+    work_compress, work_fragment = wt.ULONG(0), wt.ULONG(0)
+    status = nt.RtlGetCompressionWorkSpaceSize(
+        COMPRESSION_FORMAT_XPRESS_HUFF, ctypes.byref(work_compress), ctypes.byref(work_fragment))
+    if status != 0:
+        raise OSError(f"RtlGetCompressionWorkSpaceSize failed (NTSTATUS 0x{status & 0xFFFFFFFF:08X})")
+
+    workspace = ctypes.create_string_buffer(max(work_fragment.value, 1))
+    src = ctypes.create_string_buffer(bytes(payload), len(payload))
+    dst = ctypes.create_string_buffer(out_size)
+    final = wt.ULONG(0)
+    status = nt.RtlDecompressBufferEx(
+        COMPRESSION_FORMAT_XPRESS_HUFF, dst, out_size, src, len(payload),
+        ctypes.byref(final), workspace)
+    if status != 0:
+        raise OSError(f"RtlDecompressBufferEx failed (NTSTATUS 0x{status & 0xFFFFFFFF:08X})")
+    return dst.raw[:final.value]
+
+
+def _u32(data, off):
+    return int.from_bytes(data[off:off + 4], "little")
+
+
+def _u64(data, off):
+    return int.from_bytes(data[off:off + 8], "little")
+
+
+def _pick_run_count(data, version, nonzero_times):
+    """Read the run count. The run-time array holds min(count, 8) non-zero
+    entries, so when a version has more than one candidate offset we keep the
+    one whose value agrees with that."""
+    candidates = []
+    for off in PF_RUN_COUNT_OFFSETS.get(version, ()):
+        if off + 4 <= len(data):
+            candidates.append(_u32(data, off))
+    plausible = [c for c in candidates if 0 < c <= 1_000_000]
+    for c in plausible:
+        if min(c, 8) == nonzero_times:
+            return c
+    return plausible[0] if plausible else None
+
+
+def parse_prefetch_bytes(data):
+    """Parse the contents of one .pf file (compressed or not).
+
+    Returns a dict: version, exe_name, run_count (or None), run_times (datetimes,
+    newest first). Pure Python apart from the decompression step, so the
+    parsing itself can be unit-tested anywhere. Raises ValueError for anything
+    that isn't a prefetch file."""
+    if data[:4] == MAM_SIGNATURE:
+        data = decompress_mam(data)
+    if len(data) < 84 or data[4:8] != b"SCCA":
+        raise ValueError("missing SCCA signature")
+
+    version = _u32(data, 0)
+    if version not in PF_RUN_TIMES:
+        raise ValueError(f"unsupported prefetch format version {version}")
+
+    exe_name = data[16:76].decode("utf-16le", errors="ignore").split("\x00")[0]
+
+    times_off, slots = PF_RUN_TIMES[version]
+    run_times = []
+    for i in range(slots):
+        off = times_off + i * 8
+        if off + 8 > len(data):
+            break
+        dt = filetime_to_datetime(_u64(data, off))
+        if dt:
+            run_times.append(dt)
+    run_times.sort(reverse=True)
+
+    return {
+        "version": version,
+        "exe_name": exe_name,
+        "run_times": run_times,
+        "run_count": _pick_run_count(data, version, len(run_times)),
+    }
 
 
 def enumerate_prefetch():
@@ -457,22 +572,26 @@ def enumerate_prefetch():
             "program": prog,
             "hash": hash_part,
             "created": datetime.fromtimestamp(st.st_ctime),
-            "last_run_fs": datetime.fromtimestamp(st.st_mtime),
+            "last_run_fs": datetime.fromtimestamp(st.st_mtime),   # fallback only
+            "last_run": None,       # exact, from inside the file
+            "run_times": [],        # up to 8 most recent runs, newest first
             "run_count": None,
-            "compressed": False,
+            "version": None,
+            "parsed": False,
+            "error": "",
         }
         try:
             with open(path, "rb") as f:
-                header = f.read(8)
-            if header[:4] == b"MAM\x04":
-                info["compressed"] = True
-            else:
-                version = int.from_bytes(header[0:4], "little")
-                info["run_count"] = try_parse_run_count(path, version)
-        except Exception:
-            pass
+                parsed = parse_prefetch_bytes(f.read())
+            info["version"] = parsed["version"]
+            info["run_times"] = parsed["run_times"]
+            info["last_run"] = parsed["run_times"][0] if parsed["run_times"] else None
+            info["run_count"] = parsed["run_count"]
+            info["parsed"] = True
+        except Exception as exc:
+            info["error"] = str(exc)
         results.append(info)
-    results.sort(key=lambda r: r["last_run_fs"], reverse=True)
+    results.sort(key=lambda r: r["last_run"] or r["last_run_fs"], reverse=True)
     return results
 
 
@@ -1073,40 +1192,477 @@ def scan_account_files(paths):
     return result
 
 
+# ===========================================================================
+# GUI
+# ===========================================================================
+#
+# Layout of this section:
+#   1. Small shared helpers (CSV export, admin prompt, plural text)
+#   2. Reusable widgets: PathPicker, ProcessPicker
+#   3. Base classes:  TableTab  ->  ScanTab
+#   4. The tabs themselves (most are ~20-40 lines because the base classes do
+#      the UI building, background threading, filtering and exporting)
+#   5. App window + theming
+# ===========================================================================
+
+CSV_TYPES = [("CSV", "*.csv"), ("Text", "*.txt")]
+
+
+def ask_csv_path():
+    return filedialog.asksaveasfilename(defaultextension=".csv", filetypes=CSV_TYPES)
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def plural(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def offer_admin_restart(widget):
+    if messagebox.askyesno("Run as admin", "Restart this tool with administrator rights?"):
+        relaunch_as_admin()
+        widget.winfo_toplevel().destroy()
+
+
+def admin_status_label(parent):
+    """'Running as admin' / 'Not admin' label."""
+    ok = is_admin()
+    return ttk.Label(parent, text="Running as admin" if ok else "Not admin",
+                     foreground="green" if ok else "gray")
+
+
 # ---------------------------------------------------------------------------
-# Memory Scan tab
+# Reusable widgets
 # ---------------------------------------------------------------------------
-class MemoryScanTab(ttk.Frame):
-    COLUMNS = ("time", "pid", "address", "enc", "keyword", "string")
+class PathPicker(ttk.Frame):
+    """Checkboxes for default folders/files (unchecked if they don't exist) plus
+    a user-managed list of custom ones.
+
+    selected() -> [(label, path), ...]   custom entries are labelled "Custom".
+    """
+
+    def __init__(self, parent, defaults, default_caption, custom_caption,
+                 files=False, list_height=3, empty_text=None):
+        super().__init__(parent)
+        self.files = files
+        self.custom_paths = []
+        self.default_vars = {}          # label -> (BooleanVar, path)
+        exists = os.path.isfile if files else os.path.isdir
+
+        df = ttk.Frame(self)
+        df.pack(fill="x")
+        ttk.Label(df, text=default_caption).pack(anchor="w")
+        if not defaults and empty_text:
+            ttk.Label(df, text=empty_text, foreground="gray").pack(anchor="w")
+        for label, path in defaults:
+            found = exists(path)
+            var = tk.BooleanVar(value=found)
+            text = f"{label}   ({path})" + ("" if found else "   [not found]")
+            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
+            self.default_vars[label] = (var, path)
+
+        cf = ttk.Frame(self)
+        cf.pack(fill="x", pady=(10, 0))
+        ttk.Label(cf, text=custom_caption).pack(anchor="w")
+        row = ttk.Frame(cf)
+        row.pack(fill="x")
+        self.entry_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.entry_var, width=70).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=self._browse).pack(side="left", padx=4)
+        ttk.Button(row, text="Add", command=self._add).pack(side="left")
+        self.listbox = tk.Listbox(cf, height=list_height)
+        self.listbox.pack(fill="x", pady=(4, 0))
+        ttk.Button(cf, text="Remove selected", command=self._remove).pack(anchor="w", pady=(4, 0))
+
+    def _browse(self):
+        if self.files:
+            path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json"), ("All", "*.*")])
+        else:
+            path = filedialog.askdirectory()
+        if path:
+            self.entry_var.set(path)
+
+    def _add(self):
+        path = self.entry_var.get().strip()
+        if path and path not in self.custom_paths:
+            self.custom_paths.append(path)
+            self.listbox.insert("end", path)
+        self.entry_var.set("")
+
+    def _remove(self):
+        for i in reversed(self.listbox.curselection()):
+            del self.custom_paths[i]
+            self.listbox.delete(i)
+
+    def selected(self):
+        picked = [(label, path) for label, (var, path) in self.default_vars.items() if var.get()]
+        return picked + [("Custom", p) for p in self.custom_paths]
+
+
+def add_path_picker(parent, title, **kwargs):
+    """PathPicker inside a titled LabelFrame, packed into `parent`."""
+    box = ttk.LabelFrame(parent, text=title, padding=8)
+    box.pack(fill="x", pady=(8, 0))
+    picker = PathPicker(box, **kwargs)
+    picker.pack(fill="x")
+    return picker
+
+
+class ProcessPicker(ttk.LabelFrame):
+    """'Target process' box: name filter + Refresh + a dropdown of matches.
+
+    selected_pid() -> int | None      all_pids() -> [int, ...]
+    """
+
+    def __init__(self, parent, status_cb=None, default_filter="javaw",
+                 scan_all_option=False, show_admin=False):
+        super().__init__(parent, text="Target process", padding=8)
+        self.status_cb = status_cb
+        self.proc_map = {}
+        self.scan_all = tk.BooleanVar(value=False)
+
+        ttk.Label(self, text="Name contains:").grid(row=0, column=0, sticky="w")
+        self.name_filter = tk.StringVar(value=default_filter)
+        ttk.Entry(self, textvariable=self.name_filter, width=16).grid(row=0, column=1, padx=4)
+        ttk.Button(self, text="Refresh", command=self.refresh).grid(row=0, column=2)
+        ttk.Label(self, text="Process:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.proc_var = tk.StringVar()
+        self.combo = ttk.Combobox(self, textvariable=self.proc_var, width=32, state="readonly")
+        self.combo.grid(row=1, column=1, columnspan=2, sticky="we", pady=(6, 0), padx=4)
+        if scan_all_option:
+            ttk.Checkbutton(self, text="Scan all matching processes", variable=self.scan_all
+                            ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        if show_admin:
+            admin_status_label(self).grid(row=2, column=0, sticky="w", pady=(6, 0))
+            if not is_admin():
+                ttk.Button(self, text="Run as admin", command=lambda: offer_admin_restart(self)
+                           ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0), padx=4)
+
+    def refresh(self):
+        procs = list_processes(self.name_filter.get())
+        self.proc_map = {f"{n} (PID {pid})": pid for pid, n in procs}
+        labels = list(self.proc_map)
+        self.combo["values"] = labels
+        if labels:
+            self.combo.current(0)
+        else:
+            self.proc_var.set("")
+        if self.status_cb:
+            self.status_cb(f"Found {len(labels)} matching process(es).")
+
+    def selected_pid(self):
+        return self.proc_map.get(self.proc_var.get())
+
+    def all_pids(self):
+        return list(self.proc_map.values())
+
+
+# ---------------------------------------------------------------------------
+# Base class 1: TableTab  - note, control bar, table, status line, CSV export
+# ---------------------------------------------------------------------------
+class TableTab(ttk.Frame):
+    """Skeleton shared by every results-table tab.
+
+    Subclasses describe the tab with class attributes and fill in hooks:
+
+        NOTE            grey help text shown at the top
+        COLUMNS         ((key, heading, width), ...)
+        STRETCH         key of the column that absorbs extra width
+        SEARCH_KEYS     row-dict keys the Filter box searches
+        SORTABLE        True -> clicking a heading sorts (see sort_key)
+        EXPORT_HEADER   CSV header row
+        READY_TEXT      initial status line
+
+        build_top()             widgets between the note and the control bar
+        build_controls(ctl)     extra buttons in the control bar
+        row_values(row)         tuple of cell values for the table
+        export_row(row)         list of CSV cells for one row
+        init_state() / after_build()   run before / after the UI is built
+    """
+
+    NOTE = ""
+    COLUMNS = ()
+    STRETCH = None
+    SEARCH_KEYS = ()
+    SORTABLE = False
+    EXPORT_HEADER = ()
+    READY_TEXT = "Ready."
+    EMPTY_EXPORT_TEXT = "Nothing to export yet. Scan first."
+    HAS_CONTROL_BAR = True
+    HAS_FILTER = True
+    FILTER_WIDTH = 25
+    PADDING = 8
+    TABLE_TITLE = None        # wrap the table in a titled LabelFrame
+    TABLE_HEIGHT = None       # fixed pixel height (otherwise fills the tab)
+    TABLE_EXPAND = True
+    NOTE_WRAP = 1000
+    SELECT_MODE = "extended"
 
     def __init__(self, parent):
-        super().__init__(parent, padding=8)
+        super().__init__(parent, padding=self.PADDING)
+        self.rows = []
+        self.sort_col = None
+        self.sort_reverse = False
+        self.status = tk.StringVar(value=self.READY_TEXT)
+        self.init_state()
+        self._build_ui()
+        self.after_build()
+
+    # ---- hooks for subclasses ---------------------------------------------
+    def init_state(self):
+        pass
+
+    def after_build(self):
+        pass
+
+    def build_top(self):
+        pass
+
+    def build_controls(self, ctl):
+        pass
+
+    def row_values(self, row):
+        raise NotImplementedError
+
+    def export_row(self, row):
+        raise NotImplementedError
+
+    def export_rows(self):
+        return self.rows
+
+    def search_text(self, row):
+        return " ".join(str(row[k]) for k in self.SEARCH_KEYS).lower()
+
+    def is_visible(self, row, f):
+        return not f or f in self.search_text(row)
+
+    def sort_key(self, row, col):
+        return str(row.get(col, "")).lower()
+
+    def sort_starts_descending(self, col):
+        return False
+
+    # ---- UI construction --------------------------------------------------
+    def _build_ui(self):
+        if self.NOTE:
+            ttk.Label(self, text=self.NOTE, wraplength=self.NOTE_WRAP,
+                      foreground="gray").pack(fill="x")
+        self.build_top()
+        if self.HAS_CONTROL_BAR:
+            ctl = ttk.Frame(self)
+            ctl.pack(fill="x", pady=(8, 0))
+            self.build_controls(ctl)
+        self._build_table()
+        self.build_after_table()
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def build_after_table(self):
+        pass
+
+    def add_filter_box(self, ctl):
+        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
+        ttk.Entry(ctl, textvariable=self.filter_var, width=self.FILTER_WIDTH).pack(side="left")
+
+    def _build_table(self):
+        if self.TABLE_TITLE:
+            mid = ttk.LabelFrame(self, text=self.TABLE_TITLE, padding=4)
+        else:
+            mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=self.TABLE_EXPAND, pady=(8, 0))
+        if self.TABLE_HEIGHT:
+            mid.configure(height=self.TABLE_HEIGHT)
+            mid.pack_propagate(False)
+
+        keys = [c[0] for c in self.COLUMNS]
+        self.tree = ttk.Treeview(mid, columns=keys, show="headings", selectmode=self.SELECT_MODE)
+        for key, heading, width in self.COLUMNS:
+            cmd = (lambda k=key: self.sort_by(k)) if self.SORTABLE else ""
+            self.tree.heading(key, text=heading, command=cmd)
+            self.tree.column(key, width=width, anchor="w", stretch=(key == self.STRETCH))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+    # ---- showing rows -----------------------------------------------------
+    def set_status(self, text):
+        self.status.set(text)
+
+    def current_filter(self):
+        var = getattr(self, "filter_var", None)
+        return var.get().strip().lower() if var else ""
+
+    def visible_rows(self):
+        f = self.current_filter()
+        return [r for r in self.rows if self.is_visible(r, f)]
+
+    def insert_row(self, row):
+        self.tree.insert("", "end", values=self.row_values(row))
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        for row in self.visible_rows():
+            self.insert_row(row)
+
+    def set_rows(self, rows):
+        self.rows = rows
+        self.apply_filter()
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col, self.sort_reverse = col, self.sort_starts_descending(col)
+        self.rows.sort(key=lambda r: self.sort_key(r, col), reverse=self.sort_reverse)
+        self.apply_filter()
+
+    # ---- export -----------------------------------------------------------
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", self.EMPTY_EXPORT_TEXT)
+            return
+        path = ask_csv_path()
+        if not path:
+            return
+        rows = self.export_rows()
+        write_csv(path, self.EXPORT_HEADER, [self.export_row(r) for r in rows])
+        self.set_status(f"Exported {len(rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Base class 2: ScanTab - adds the Scan button, background worker, filter box
+# ---------------------------------------------------------------------------
+class ScanTab(TableTab):
+    """A TableTab driven by a 'Scan' button.
+
+    Subclasses implement:
+        prepare_scan()   runs on the UI thread; validate inputs / show warnings.
+                         Return a tuple of arguments for scan(), or None to abort.
+        scan(*args)      does the work (on a background thread when THREADED)
+                         and returns the list of rows. May use self.stop_event
+                         and self.report_progress(pct).
+        done_message(rows)   status text once finished.
+    Optional: on_scan_done(rows) to update extra widgets.
+    """
+
+    SCAN_LABEL = "Scan"
+    BUSY_TEXT = "Scanning..."
+    ERROR_TITLE = "Scan failed"
+    THREADED = True
+    HAS_PROGRESS = False
+
+    def init_state(self):
+        self.worker = None
+        self.stop_event = threading.Event()
+
+    # ---- hooks ------------------------------------------------------------
+    def prepare_scan(self):
+        return ()
+
+    def scan(self, *args):
+        raise NotImplementedError
+
+    def done_message(self, rows):
+        return f"Found {len(rows)} result(s)."
+
+    def on_scan_done(self, rows):
+        pass
+
+    # ---- control bar ------------------------------------------------------
+    def build_controls(self, ctl):
+        self.scan_btn = ttk.Button(ctl, text=self.SCAN_LABEL, command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        self.build_extra_controls(ctl)
+        if self.HAS_FILTER:
+            self.add_filter_box(ctl)
+        if self.HAS_PROGRESS:
+            self.progress = ttk.Progressbar(ctl, length=200, maximum=100)
+            self.progress.pack(side="right")
+
+    def build_extra_controls(self, ctl):
+        pass
+
+    def report_progress(self, pct):
+        """Safe to call from the worker thread."""
+        self.after(0, lambda: self.progress.configure(value=pct))
+
+    # ---- running a scan ---------------------------------------------------
+    def start_scan(self):
+        if self.worker and self.worker.is_alive():
+            return
+        args = self.prepare_scan()
+        if args is None:
+            return
+        self.stop_event.clear()
+        if self.HAS_PROGRESS:
+            self.progress["value"] = 0
+        self.scan_btn.config(state="disabled")
+        self.set_status(self.BUSY_TEXT)
+        if self.THREADED:
+            self.worker = threading.Thread(target=self._run, args=args, daemon=True)
+            self.worker.start()
+        else:
+            self._run(*args)
+
+    def _run(self, *args):
+        try:
+            rows = self.scan(*args)
+        except Exception as exc:
+            rows = []
+            msg = str(exc)
+            self.after(0, lambda: messagebox.showerror(self.ERROR_TITLE, msg))
+        if self.THREADED:
+            self.after(0, lambda: self._finish(rows))
+        else:
+            self._finish(rows)
+
+    def _finish(self, rows):
+        self.on_scan_done(rows)
+        self.set_rows(rows)
+        self.scan_btn.config(state="normal")
+        self.set_status(self.done_message(rows))
+
+
+# ===========================================================================
+# Tabs
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Memory Scan tab  (streams hits from a worker via a queue, so it overrides
+# more of the ScanTab/TableTab behaviour than the others do)
+# ---------------------------------------------------------------------------
+class MemoryScanTab(TableTab):
+    COLUMNS = (("time", "Time", 70), ("pid", "Pid", 60), ("address", "Address", 140),
+               ("enc", "Enc", 55), ("keyword", "Keyword", 120), ("string", "String", 600))
+    STRETCH = "string"
+    EXPORT_HEADER = [c[0] for c in COLUMNS]
+    EMPTY_EXPORT_TEXT = "Nothing to export yet."
+    SELECT_MODE = "browse"
+
+    def init_state(self):
         self.q = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
-        self.rows = []
-        self.proc_map = {}
-        self._build_ui()
-        self.refresh_processes()
+
+    def after_build(self):
+        self.procs.refresh()
         self.after(100, self._poll_queue)
 
-    def _build_ui(self):
+    # ---- UI ----------------------------------------------------------------
+    def build_top(self):
         top = ttk.Frame(self)
         top.pack(fill="x")
 
-        pf = ttk.LabelFrame(top, text="Target process", padding=8)
-        pf.pack(side="left", fill="y", padx=(0, 8))
-        ttk.Label(pf, text="Name contains:").grid(row=0, column=0, sticky="w")
-        self.name_filter = tk.StringVar(value="javaw")
-        ttk.Entry(pf, textvariable=self.name_filter, width=16).grid(row=0, column=1, padx=4)
-        ttk.Button(pf, text="Refresh", command=self.refresh_processes).grid(row=0, column=2)
-        ttk.Label(pf, text="Process:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.proc_var = tk.StringVar()
-        self.proc_combo = ttk.Combobox(pf, textvariable=self.proc_var, width=32, state="readonly")
-        self.proc_combo.grid(row=1, column=1, columnspan=2, sticky="we", pady=(6, 0), padx=4)
-        self.scan_all = tk.BooleanVar(value=False)
-        ttk.Checkbutton(pf, text="Scan all matching processes", variable=self.scan_all
-                        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.procs = ProcessPicker(top, status_cb=self.set_status, scan_all_option=True)
+        self.procs.pack(side="left", fill="y", padx=(0, 8))
 
         of = ttk.LabelFrame(top, text="Options", padding=8)
         of.pack(side="left", fill="y", padx=(0, 8))
@@ -1117,68 +1673,50 @@ class MemoryScanTab(ttk.Frame):
         self.dump_all = tk.BooleanVar(value=False)
         ttk.Checkbutton(of, text="Also save ALL strings to file", variable=self.dump_all
                         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        admin_text = "Running as admin" if is_admin() else "Not admin"
-        ttk.Label(of, text=admin_text, foreground="green" if is_admin() else "gray"
-                  ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        admin_status_label(of).grid(row=2, column=0, sticky="w", pady=(6, 0))
         if not is_admin():
-            ttk.Button(of, text="Run as admin", command=self.run_admin
+            ttk.Button(of, text="Run as admin", command=lambda: offer_admin_restart(self)
                        ).grid(row=2, column=1, pady=(6, 0))
 
         kf = ttk.LabelFrame(top, text="Keywords (one per line, case-insensitive)", padding=8)
         kf.pack(side="left", fill="both", expand=True)
         self.kw_text = tk.Text(kf, height=6, width=30)
         self.kw_text.pack(side="left", fill="both", expand=True)
-        self.kw_text.insert("1.0", "\n".join(DEFAULT_KEYWORDS))
+        self.reset_keywords()
         kb = ttk.Frame(kf)
         kb.pack(side="left", fill="y", padx=(6, 0))
         ttk.Button(kb, text="Load...", command=self.load_keywords).pack(fill="x")
         ttk.Button(kb, text="Save...", command=self.save_keywords).pack(fill="x", pady=4)
         ttk.Button(kb, text="Reset", command=self.reset_keywords).pack(fill="x")
 
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
+    def build_controls(self, ctl):
         self.start_btn = ttk.Button(ctl, text="Start scan", command=self.start_scan)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(ctl, text="Stop", command=self.stop_scan, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
         ttk.Button(ctl, text="Export...", command=self.export).pack(side="left")
         ttk.Button(ctl, text="Clear", command=self.clear_results).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
+        self.add_filter_box(ctl)
         self.progress = ttk.Progressbar(ctl, length=220, maximum=100)
         self.progress.pack(side="right")
 
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings", selectmode="browse")
-        widths = {"time": 70, "pid": 60, "address": 140, "enc": 55, "keyword": 120, "string": 600}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=c.capitalize())
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "string"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
+    def build_after_table(self):
         self.tree.bind("<<TreeviewSelect>>", self.show_detail)
-
         self.detail = tk.Text(self, height=4, wrap="word", state="disabled")
         self.detail.pack(fill="x", pady=(8, 0))
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(4, 0))
 
-    def refresh_processes(self):
-        procs = list_processes(self.name_filter.get())
-        self.proc_map = {f"{n} (PID {pid})": pid for pid, n in procs}
-        labels = list(self.proc_map)
-        self.proc_combo["values"] = labels
-        if labels:
-            self.proc_combo.current(0)
-        else:
-            self.proc_var.set("")
-        self.status.set(f"Found {len(labels)} matching process(es).")
+    # ---- rows are plain tuples here ---------------------------------------
+    def row_values(self, row):
+        time_, pid, addr, enc, kw, text = row
+        return (time_, pid, addr, enc, kw, text[:300])
 
+    def search_text(self, row):
+        return " ".join(str(v) for v in row).lower()
+
+    def export_row(self, row):
+        return list(row)
+
+    # ---- keywords ----------------------------------------------------------
     def get_keywords(self):
         lines = self.kw_text.get("1.0", "end").splitlines()
         return [ln.strip().lower() for ln in lines if ln.strip() and not ln.startswith("#")]
@@ -1201,18 +1739,14 @@ class MemoryScanTab(ttk.Frame):
         self.kw_text.delete("1.0", "end")
         self.kw_text.insert("1.0", "\n".join(DEFAULT_KEYWORDS))
 
-    def run_admin(self):
-        if messagebox.askyesno("Run as admin", "Restart this tool with administrator rights?"):
-            relaunch_as_admin()
-            self.winfo_toplevel().destroy()
-
+    # ---- scanning ----------------------------------------------------------
     def start_scan(self):
         if self.worker and self.worker.is_alive():
             return
-        if self.scan_all.get():
-            pids = list(self.proc_map.values())
+        if self.procs.scan_all.get():
+            pids = self.procs.all_pids()
         else:
-            pid = self.proc_map.get(self.proc_var.get())
+            pid = self.procs.selected_pid()
             pids = [pid] if pid else []
         if not pids:
             messagebox.showwarning("No process", "No target process selected. "
@@ -1233,7 +1767,7 @@ class MemoryScanTab(ttk.Frame):
         self.progress["value"] = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status.set(f"Scanning {len(pids)} process(es)...")
+        self.set_status(f"Scanning {len(pids)} process(es)...")
 
         self.worker = threading.Thread(
             target=self._worker, args=(pids, kw_regex, min_len, self.dump_all.get()),
@@ -1242,7 +1776,7 @@ class MemoryScanTab(ttk.Frame):
 
     def stop_scan(self):
         self.stop_event.set()
-        self.status.set("Stopping...")
+        self.set_status("Stopping...")
 
     def _worker(self, pids, kw_regex, min_len, dump_all):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1273,12 +1807,12 @@ class MemoryScanTab(ttk.Frame):
                 kind = msg[0]
                 if kind == "hit":
                     self.rows.append(msg[1])
-                    if self._row_matches_filter(msg[1]):
-                        self._insert_row(msg[1])
+                    if self.is_visible(msg[1], self.current_filter()):
+                        self.insert_row(msg[1])
                 elif kind == "progress":
                     self.progress["value"] = msg[1]
                 elif kind == "status":
-                    self.status.set(msg[1])
+                    self.set_status(msg[1])
                 elif kind == "done":
                     self._finish(msg[1], msg[2], msg[3])
         except queue.Empty:
@@ -1291,28 +1825,15 @@ class MemoryScanTab(ttk.Frame):
         log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
         self._write_log(log_path)
         state = "Stopped" if self.stop_event.is_set() else "Done"
-        self.status.set(f"{state}. {summary or 'No data.'}  Log saved: {log_path}")
+        self.set_status(f"{state}. {summary or 'No data.'}  Log saved: {log_path}")
 
-    def _insert_row(self, row):
-        time_, pid, addr, enc, kw, text = row
-        self.tree.insert("", "end", values=(time_, pid, addr, enc, kw, text[:300]))
-
-    def _row_matches_filter(self, row):
-        f = self.filter_var.get().strip().lower()
-        return not f or any(f in str(v).lower() for v in row)
-
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        for row in self.rows:
-            if self._row_matches_filter(row):
-                self._insert_row(row)
-
+    # ---- details, clear, export -------------------------------------------
     def show_detail(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             return
         idx = self.tree.index(sel[0])
-        visible = [r for r in self.rows if self._row_matches_filter(r)]
+        visible = self.visible_rows()
         if idx < len(visible):
             row = visible[idx]
             self.detail.config(state="normal")
@@ -1329,7 +1850,7 @@ class MemoryScanTab(ttk.Frame):
         with open(path, "w", encoding="utf-8", newline="") as f:
             if path.lower().endswith(".csv"):
                 w = csv.writer(f)
-                w.writerow(self.COLUMNS)
+                w.writerow(self.EXPORT_HEADER)
                 w.writerows(self.rows)
             else:
                 f.write(f"# SS string log - {datetime.now().isoformat()}\n")
@@ -1339,109 +1860,57 @@ class MemoryScanTab(ttk.Frame):
 
     def export(self):
         if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet.")
+            messagebox.showinfo("Export", self.EMPTY_EXPORT_TEXT)
             return
         path = filedialog.asksaveasfilename(
             defaultextension=".txt", filetypes=[("Text log", "*.txt"), ("CSV", "*.csv")])
         if path:
             self._write_log(path)
-            self.status.set(f"Exported {len(self.rows)} rows to {path}")
+            self.set_status(f"Exported {len(self.rows)} rows to {path}")
 
 
 # ---------------------------------------------------------------------------
 # DLL Scanner tab
 # ---------------------------------------------------------------------------
-class DLLScannerTab(ttk.Frame):
-    COLUMNS = ("name", "location", "base", "size", "path")
+class DLLScannerTab(ScanTab):
+    NOTE = ("Lists DLLs (and the main exe) currently loaded into a process - "
+            "catches cheats injected as a module rather than run as their own "
+            "visible program. \"Location\" just tells you whether the file sits "
+            "under Windows' system folder or the game's own folder; anything "
+            "else is worth a closer look, not automatic proof of anything.")
+    COLUMNS = (("name", "Module", 220), ("location", "Location", 110),
+               ("base", "Base address", 140), ("size", "Size (bytes)", 90),
+               ("path", "Full path", 440))
+    STRETCH = "path"
+    SEARCH_KEYS = ("name", "path", "location")
+    EXPORT_HEADER = ["module", "location", "base_address", "size_bytes", "path"]
+    SCAN_LABEL = "Scan loaded modules"
+    THREADED = False        # a module snapshot is near-instant
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.rows = []
-        self.proc_map = {}
-        self._build_ui()
-        self.refresh_processes()
+    def build_top(self):
+        self.procs = ProcessPicker(self, status_cb=self.set_status, show_admin=True)
+        self.procs.pack(fill="x", pady=(8, 0))
 
-    def _build_ui(self):
-        note = ("Lists DLLs (and the main exe) currently loaded into a process - "
-                "catches cheats injected as a module rather than run as their own "
-                "visible program. \"Location\" just tells you whether the file sits "
-                "under Windows' system folder or the game's own folder; anything "
-                "else is worth a closer look, not automatic proof of anything.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+    def after_build(self):
+        self.procs.refresh()
 
-        pf = ttk.LabelFrame(self, text="Target process", padding=8)
-        pf.pack(fill="x", pady=(8, 0))
-        ttk.Label(pf, text="Name contains:").grid(row=0, column=0, sticky="w")
-        self.name_filter = tk.StringVar(value="javaw")
-        ttk.Entry(pf, textvariable=self.name_filter, width=16).grid(row=0, column=1, padx=4)
-        ttk.Button(pf, text="Refresh", command=self.refresh_processes).grid(row=0, column=2)
-        ttk.Label(pf, text="Process:").grid(row=0, column=3, sticky="w", padx=(12, 0))
-        self.proc_var = tk.StringVar()
-        self.proc_combo = ttk.Combobox(pf, textvariable=self.proc_var, width=32, state="readonly")
-        self.proc_combo.grid(row=0, column=4, sticky="we", padx=4)
-        admin_text = "Running as admin" if is_admin() else "Not admin"
-        ttk.Label(pf, text=admin_text, foreground="green" if is_admin() else "gray"
-                  ).grid(row=0, column=5, padx=(12, 0))
-        if not is_admin():
-            ttk.Button(pf, text="Run as admin", command=self.run_admin).grid(row=0, column=6)
-
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan loaded modules", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
-
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"name": 220, "location": 110, "base": 140, "size": 90, "path": 440}
-        labels = {"name": "Module", "location": "Location", "base": "Base address",
-                  "size": "Size (bytes)", "path": "Full path"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "path"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def refresh_processes(self):
-        procs = list_processes(self.name_filter.get())
-        self.proc_map = {f"{n} (PID {pid})": pid for pid, n in procs}
-        labels = list(self.proc_map)
-        self.proc_combo["values"] = labels
-        if labels:
-            self.proc_combo.current(0)
-        else:
-            self.proc_var.set("")
-        self.status.set(f"Found {len(labels)} matching process(es).")
-
-    def run_admin(self):
-        if messagebox.askyesno("Run as admin", "Restart this tool with administrator rights?"):
-            relaunch_as_admin()
-            self.winfo_toplevel().destroy()
-
-    def start_scan(self):
-        pid = self.proc_map.get(self.proc_var.get())
+    def prepare_scan(self):
+        pid = self.procs.selected_pid()
         if not pid:
             messagebox.showwarning("No process", "No target process selected. Try Refresh.")
-            return
+            return None
         modules = list_modules(pid)
         if modules is None:
             messagebox.showerror(
                 "Couldn't read modules",
                 f"Could not snapshot modules for PID {pid} (error {ctypes.get_last_error()}). "
                 f"Try 'Run as admin', or the process may have exited.")
-            return
-        game_dir = get_process_exe_dir(pid)
-        self.rows = []
+            return None
+        self.scanned_pid = pid
+        return (modules, get_process_exe_dir(pid))
+
+    def scan(self, modules, game_dir):
+        rows = []
         for m in modules:
             if is_system_module_path(m["path"]):
                 location = "system"
@@ -1449,760 +1918,311 @@ class DLLScannerTab(ttk.Frame):
                 location = "game folder"
             else:
                 location = "other"
-            self.rows.append({**m, "location": location})
-        self.apply_filter()
-        self.status.set(f"PID {pid}: {len(self.rows)} loaded module(s).")
+            rows.append({**m, "location": location})
+        return rows
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for m in self.rows:
-            if f and f not in m["name"].lower() and f not in m["path"].lower() and f not in m["location"]:
-                continue
-            self.tree.insert("", "end", values=(
-                m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]))
+    def done_message(self, rows):
+        return f"PID {self.scanned_pid}: {len(rows)} loaded module(s)."
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["module", "location", "base_address", "size_bytes", "path"])
-            for m in self.rows:
-                w.writerow([m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def row_values(self, m):
+        return (m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"])
+
+    def export_row(self, m):
+        return [m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]]
 
 
 # ---------------------------------------------------------------------------
 # Recycle Bin tab
 # ---------------------------------------------------------------------------
-class RecycleBinTab(ttk.Frame):
-    COLUMNS = ("deleted", "original_path", "size", "drive", "sid")
+class RecycleBinTab(ScanTab):
+    NOTE = ("Reads deleted-file metadata from each drive's $Recycle.Bin. "
+            "Only the current Windows account's own recycle bin folder is "
+            "reliably readable without admin rights.")
+    COLUMNS = (("deleted", "Deleted", 150), ("original_path", "Original path", 620),
+               ("size", "Size (bytes)", 90), ("drive", "Drive", 60), ("sid", "Account SID", 160))
+    STRETCH = "original_path"
+    SEARCH_KEYS = ("original_path",)
+    EXPORT_HEADER = ["deleted_time", "original_path", "size_bytes", "drive", "sid"]
+    FILTER_WIDTH = 30
+    SCAN_LABEL = "Scan Recycle Bin"
+    BUSY_TEXT = "Scanning $Recycle.Bin on all drives..."
+    ERROR_TITLE = "Recycle Bin scan failed"
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.rows = []
-        self.stop_event = threading.Event()
-        self.worker = None
-        self._build_ui()
+    def scan(self):
+        return enumerate_recycle_bin(self.stop_event)
 
-    def _build_ui(self):
-        note = ("Reads deleted-file metadata from each drive's $Recycle.Bin. "
-                "Only the current Windows account's own recycle bin folder is "
-                "reliably readable without admin rights.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+    def done_message(self, rows):
+        return f"Found {len(rows)} deleted-file record(s)."
 
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan Recycle Bin", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=30).pack(side="left")
+    def row_values(self, r):
+        return (fmt_dt(r["deleted_time"]), r["original_path"], r["file_size"], r["drive"], r["sid"])
 
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"deleted": 150, "original_path": 620, "size": 90, "drive": 60, "sid": 160}
-        labels = {"deleted": "Deleted", "original_path": "Original path", "size": "Size (bytes)",
-                  "drive": "Drive", "sid": "Account SID"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "original_path"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
-        self.scan_btn.config(state="disabled")
-        self.status.set("Scanning $Recycle.Bin on all drives...")
-        self.stop_event.clear()
-        self.worker = threading.Thread(target=self._worker, daemon=True)
-        self.worker.start()
-
-    def _worker(self):
-        try:
-            rows = enumerate_recycle_bin(self.stop_event)
-        except Exception as exc:
-            rows = []
-            self.after(0, lambda: messagebox.showerror("Recycle Bin scan failed", str(exc)))
-        self.after(0, lambda: self._finish(rows))
-
-    def _finish(self, rows):
-        self.rows = rows
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(rows)} deleted-file record(s).")
-
-    def _insert_row(self, r):
-        self.tree.insert("", "end", values=(
-            fmt_dt(r["deleted_time"]), r["original_path"], r["file_size"], r["drive"], r["sid"]))
-
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for r in self.rows:
-            if not f or f in r["original_path"].lower():
-                self._insert_row(r)
-
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["deleted_time", "original_path", "size_bytes", "drive", "sid"])
-            for r in self.rows:
-                w.writerow([fmt_dt(r["deleted_time"]), r["original_path"],
-                           r["file_size"], r["drive"], r["sid"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def export_row(self, r):
+        return [fmt_dt(r["deleted_time"]), r["original_path"], r["file_size"], r["drive"], r["sid"]]
 
 
 # ---------------------------------------------------------------------------
 # Prefetch tab
 # ---------------------------------------------------------------------------
-class PrefetchTab(ttk.Frame):
-    COLUMNS = ("program", "hash", "created", "last_run", "run_count", "compressed")
+class PrefetchTab(ScanTab):
+    NOTE = ("Reads C:\\Windows\\Prefetch for program run history. Needs admin rights "
+            "to read, and only exists if prefetch is enabled. Windows 10/11 files are "
+            "decompressed and read in full: \"Last run\", \"Run count\" and \"Earlier "
+            "runs\" come from inside the file (the last 8 runs). If a file can't be "
+            "parsed, the file-system times are shown instead and \"Parsed\" says no.")
+    COLUMNS = (("program", "Program", 240), ("hash", "Hash", 80), ("created", "First seen", 140),
+               ("last_run", "Last run", 140), ("run_count", "Run count", 70),
+               ("earlier", "Earlier runs (newest first)", 330), ("parsed", "Parsed", 90))
+    STRETCH = "earlier"
+    SEARCH_KEYS = ("program",)
+    EXPORT_HEADER = ["program", "hash", "first_seen", "last_run", "run_count",
+                     "earlier_runs", "parsed", "format_version", "parse_error"]
+    FILTER_WIDTH = 30
+    SCAN_LABEL = "Scan Prefetch"
+    BUSY_TEXT = "Scanning Prefetch..."
+    ERROR_TITLE = "Prefetch scan failed"
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.rows = []
-        self.worker = None
-        self._build_ui()
-
-    def _build_ui(self):
-        note = ("Reads C:\\Windows\\Prefetch for program run history. Needs admin "
-                "rights to read, and only exists if prefetch is enabled. Windows 10/11 "
-                "prefetch files are compressed; run count isn't parsed for those, only "
-                "the program name and file-system timestamps are shown. \"Last run\" is "
-                "the prefetch file's last-modified time, used as an approximation.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
-
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan Prefetch", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=30).pack(side="left")
-
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"program": 260, "hash": 90, "created": 150, "last_run": 150,
-                  "run_count": 90, "compressed": 90}
-        labels = {"program": "Program", "hash": "Hash", "created": "First seen",
-                  "last_run": "Last run (approx.)", "run_count": "Run count (approx.)",
-                  "compressed": "Compressed"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "program"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
+    def prepare_scan(self):
         if not is_admin():
             messagebox.showwarning("Admin needed",
                                    "Reading the Prefetch folder usually needs admin rights. "
                                    "Restart as admin from the Memory Scan tab if this comes back empty.")
-        self.scan_btn.config(state="disabled")
-        self.status.set("Scanning Prefetch...")
-        self.worker = threading.Thread(target=self._worker, daemon=True)
-        self.worker.start()
+        return ()
 
-    def _worker(self):
-        try:
-            rows = enumerate_prefetch()
-        except Exception as exc:
-            rows = []
-            self.after(0, lambda: messagebox.showerror("Prefetch scan failed", str(exc)))
-        self.after(0, lambda: self._finish(rows))
+    def scan(self):
+        return enumerate_prefetch()
 
-    def _finish(self, rows):
-        self.rows = rows
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(rows)} prefetch entr{'y' if len(rows)==1 else 'ies'}.")
+    def done_message(self, rows):
+        parsed = sum(1 for r in rows if r["parsed"])
+        return f"Found {plural(len(rows), 'prefetch entry', 'prefetch entries')} ({parsed} parsed)."
 
-    def _insert_row(self, r):
-        self.tree.insert("", "end", values=(
-            r["program"], r["hash"], fmt_dt(r["created"]), fmt_dt(r["last_run_fs"]),
-            r["run_count"] if r["run_count"] is not None else "-",
-            "yes" if r["compressed"] else "no"))
+    @staticmethod
+    def _last_run(r):
+        return r["last_run"] or r["last_run_fs"]
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for r in self.rows:
-            if not f or f in r["program"].lower():
-                self._insert_row(r)
+    @staticmethod
+    def _earlier(r):
+        return ", ".join(fmt_dt(t) for t in r["run_times"][1:])
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["program", "hash", "first_seen", "last_run_approx",
-                       "run_count_approx", "compressed"])
-            for r in self.rows:
-                w.writerow([r["program"], r["hash"], fmt_dt(r["created"]),
-                           fmt_dt(r["last_run_fs"]), r["run_count"], r["compressed"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def row_values(self, r):
+        return (r["program"], r["hash"], fmt_dt(r["created"]), fmt_dt(self._last_run(r)),
+                r["run_count"] if r["run_count"] is not None else "-",
+                self._earlier(r), "yes" if r["parsed"] else "no")
+
+    def export_row(self, r):
+        version = PF_VERSIONS.get(r["version"], r["version"] or "")
+        return [r["program"], r["hash"], fmt_dt(r["created"]), fmt_dt(self._last_run(r)),
+                r["run_count"] if r["run_count"] is not None else "", self._earlier(r),
+                r["parsed"], version, r["error"]]
 
 
 # ---------------------------------------------------------------------------
 # Mods Scanner tab
 # ---------------------------------------------------------------------------
-class ModsScannerTab(ttk.Frame):
-    COLUMNS = ("launcher", "profile", "file", "size", "modified", "sha256")
+class ModsScannerTab(ScanTab):
+    NOTE = ("Finds every \"mods\" folder under each launcher's data folder, "
+            "including profile/instance-based launchers like CurseForge, "
+            "Modrinth App, and Dawn where each instance keeps its own mods "
+            "folder rather than one global one. Lists each jar with a SHA-256 "
+            "hash (skipped for files over 20 MB) so you can compare against "
+            "known-bad hashes if you keep a list.")
+    COLUMNS = (("launcher", "Launcher", 130), ("profile", "Profile/instance", 150),
+               ("file", "File", 220), ("size", "Size (bytes)", 90),
+               ("modified", "Modified", 140), ("sha256", "SHA-256", 280))
+    STRETCH = "sha256"
+    SEARCH_KEYS = ("file", "profile", "launcher")
+    EXPORT_HEADER = ["launcher", "profile", "file", "size_bytes", "modified", "sha256", "full_path"]
+    SCAN_LABEL = "Scan mods"
+    BUSY_TEXT = "Scanning for mods folders..."
+    ERROR_TITLE = "Mods scan failed"
+    HAS_PROGRESS = True
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.default_roots = get_default_client_roots()
-        self.default_vars = {}
-        self.custom_paths = []
-        self.rows = []
-        self.worker = None
-        self.stop_event = threading.Event()
-        self._build_ui()
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, "Search locations", defaults=get_default_client_roots(),
+            default_caption="Default launcher folders (unchecked ones weren't found):",
+            custom_caption="Custom launcher/instance folder:")
 
-    def _build_ui(self):
-        note = ("Finds every \"mods\" folder under each launcher's data folder, "
-                "including profile/instance-based launchers like CurseForge, "
-                "Modrinth App, and Dawn where each instance keeps its own mods "
-                "folder rather than one global one. Lists each jar with a SHA-256 "
-                "hash (skipped for files over 20 MB) so you can compare against "
-                "known-bad hashes if you keep a list.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
-
-        paths_frame = ttk.LabelFrame(self, text="Search locations", padding=8)
-        paths_frame.pack(fill="x", pady=(8, 0))
-
-        df = ttk.Frame(paths_frame)
-        df.pack(fill="x")
-        ttk.Label(df, text="Default launcher folders (unchecked ones weren't found):"
-                  ).pack(anchor="w")
-        for label, path in self.default_roots:
-            exists = os.path.isdir(path)
-            var = tk.BooleanVar(value=exists)
-            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
-            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
-            self.default_vars[label] = (var, path)
-
-        cf = ttk.Frame(paths_frame)
-        cf.pack(fill="x", pady=(10, 0))
-        ttk.Label(cf, text="Custom launcher/instance folder:").pack(anchor="w")
-        row = ttk.Frame(cf)
-        row.pack(fill="x")
-        self.custom_entry = tk.StringVar()
-        ttk.Entry(row, textvariable=self.custom_entry, width=70).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse...", command=self.browse_path).pack(side="left", padx=4)
-        ttk.Button(row, text="Add", command=self.add_custom_path).pack(side="left")
-        self.custom_list = tk.Listbox(cf, height=3)
-        self.custom_list.pack(fill="x", pady=(4, 0))
-        ttk.Button(cf, text="Remove selected", command=self.remove_custom_path
-                  ).pack(anchor="w", pady=(4, 0))
-
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan mods", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
-        self.progress = ttk.Progressbar(ctl, length=200, maximum=100)
-        self.progress.pack(side="right")
-
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"launcher": 130, "profile": 150, "file": 220, "size": 90,
-                  "modified": 140, "sha256": 280}
-        labels = {"launcher": "Launcher", "profile": "Profile/instance", "file": "File",
-                  "size": "Size (bytes)", "modified": "Modified", "sha256": "SHA-256"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "sha256"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def browse_path(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.custom_entry.set(path)
-
-    def add_custom_path(self):
-        path = self.custom_entry.get().strip()
-        if path and path not in self.custom_paths:
-            self.custom_paths.append(path)
-            self.custom_list.insert("end", path)
-        self.custom_entry.set("")
-
-    def remove_custom_path(self):
-        for i in reversed(self.custom_list.curselection()):
-            del self.custom_paths[i]
-            self.custom_list.delete(i)
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
-        roots = [(label, path) for (label, (var, path)) in self.default_vars.items() if var.get()]
-        roots += [("Custom", p) for p in self.custom_paths]
+    def prepare_scan(self):
+        roots = self.picker.selected()
         if not roots:
             messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return
-        self.stop_event.clear()
-        self.progress["value"] = 0
-        self.scan_btn.config(state="disabled")
-        self.status.set("Scanning for mods folders...")
-        self.worker = threading.Thread(target=self._worker, args=(roots,), daemon=True)
-        self.worker.start()
+            return None
+        return (roots,)
 
-    def _worker(self, roots):
-        def on_progress(pct):
-            self.after(0, lambda: self.progress.configure(value=pct))
-        try:
-            rows = scan_mods(roots, self.stop_event, on_progress)
-        except Exception as exc:
-            rows = []
-            self.after(0, lambda: messagebox.showerror("Mods scan failed", str(exc)))
-        self.after(0, lambda: self._finish(rows))
+    def scan(self, roots):
+        return scan_mods(roots, self.stop_event, self.report_progress)
 
-    def _finish(self, rows):
-        self.rows = rows
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(rows)} mod jar(s).")
+    def done_message(self, rows):
+        return f"Found {len(rows)} mod jar(s)."
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for m in self.rows:
-            hay = f"{m['file']} {m['profile']} {m['launcher']}".lower()
-            if f and f not in hay:
-                continue
-            self.tree.insert("", "end", values=(
-                m["launcher"], m["profile"], m["file"], m["size"], fmt_dt(m["modified"]), m["sha256"]))
+    def row_values(self, m):
+        return (m["launcher"], m["profile"], m["file"], m["size"], fmt_dt(m["modified"]), m["sha256"])
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["launcher", "profile", "file", "size_bytes", "modified", "sha256", "full_path"])
-            for m in self.rows:
-                w.writerow([m["launcher"], m["profile"], m["file"], m["size"],
-                           fmt_dt(m["modified"]), m["sha256"], m["path"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def export_row(self, m):
+        return [m["launcher"], m["profile"], m["file"], m["size"],
+                fmt_dt(m["modified"]), m["sha256"], m["path"]]
 
 
 # ---------------------------------------------------------------------------
 # Servers tab (recent/saved servers across launchers and profiles)
 # ---------------------------------------------------------------------------
-class ServersTab(ttk.Frame):
-    COLUMNS = ("launcher", "profile", "name", "ip", "source")
+class ServersTab(ScanTab):
+    NOTE = ("Reads servers.dat (the multiplayer server list) from every "
+            "launcher/instance folder found, including profile-based "
+            "launchers where each instance keeps its own list.")
+    COLUMNS = (("launcher", "Launcher", 130), ("profile", "Profile/instance", 150),
+               ("name", "Server name", 200), ("ip", "Address", 200), ("source", "Source file", 320))
+    STRETCH = "source"
+    SEARCH_KEYS = ("name", "ip", "profile", "launcher")
+    EXPORT_HEADER = ["launcher", "profile", "server_name", "address", "source_file"]
+    SCAN_LABEL = "Scan servers"
+    BUSY_TEXT = "Scanning for servers.dat files..."
+    ERROR_TITLE = "Server scan failed"
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.default_roots = get_default_client_roots()
-        self.default_vars = {}
-        self.custom_paths = []
-        self.rows = []
-        self.worker = None
-        self._build_ui()
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, "Search locations", defaults=get_default_client_roots(),
+            default_caption="Default launcher folders (unchecked ones weren't found):",
+            custom_caption="Custom launcher/instance folder:")
 
-    def _build_ui(self):
-        note = ("Reads servers.dat (the multiplayer server list) from every "
-                "launcher/instance folder found, including profile-based "
-                "launchers where each instance keeps its own list.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
-
-        paths_frame = ttk.LabelFrame(self, text="Search locations", padding=8)
-        paths_frame.pack(fill="x", pady=(8, 0))
-
-        df = ttk.Frame(paths_frame)
-        df.pack(fill="x")
-        ttk.Label(df, text="Default launcher folders (unchecked ones weren't found):"
-                  ).pack(anchor="w")
-        for label, path in self.default_roots:
-            exists = os.path.isdir(path)
-            var = tk.BooleanVar(value=exists)
-            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
-            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
-            self.default_vars[label] = (var, path)
-
-        cf = ttk.Frame(paths_frame)
-        cf.pack(fill="x", pady=(10, 0))
-        ttk.Label(cf, text="Custom launcher/instance folder:").pack(anchor="w")
-        row = ttk.Frame(cf)
-        row.pack(fill="x")
-        self.custom_entry = tk.StringVar()
-        ttk.Entry(row, textvariable=self.custom_entry, width=70).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse...", command=self.browse_path).pack(side="left", padx=4)
-        ttk.Button(row, text="Add", command=self.add_custom_path).pack(side="left")
-        self.custom_list = tk.Listbox(cf, height=3)
-        self.custom_list.pack(fill="x", pady=(4, 0))
-        ttk.Button(cf, text="Remove selected", command=self.remove_custom_path
-                  ).pack(anchor="w", pady=(4, 0))
-
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan servers", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
-
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"launcher": 130, "profile": 150, "name": 200, "ip": 200, "source": 320}
-        labels = {"launcher": "Launcher", "profile": "Profile/instance", "name": "Server name",
-                  "ip": "Address", "source": "Source file"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "source"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def browse_path(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.custom_entry.set(path)
-
-    def add_custom_path(self):
-        path = self.custom_entry.get().strip()
-        if path and path not in self.custom_paths:
-            self.custom_paths.append(path)
-            self.custom_list.insert("end", path)
-        self.custom_entry.set("")
-
-    def remove_custom_path(self):
-        for i in reversed(self.custom_list.curselection()):
-            del self.custom_paths[i]
-            self.custom_list.delete(i)
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
-        roots = [(label, path) for (label, (var, path)) in self.default_vars.items() if var.get()]
-        roots += [("Custom", p) for p in self.custom_paths]
+    def prepare_scan(self):
+        roots = self.picker.selected()
         if not roots:
             messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return
-        self.scan_btn.config(state="disabled")
-        self.status.set("Scanning for servers.dat files...")
-        self.worker = threading.Thread(target=self._worker, args=(roots,), daemon=True)
-        self.worker.start()
+            return None
+        return (roots,)
 
-    def _worker(self, roots):
-        try:
-            rows = scan_servers(roots)
-        except Exception as exc:
-            rows = []
-            self.after(0, lambda: messagebox.showerror("Server scan failed", str(exc)))
-        self.after(0, lambda: self._finish(rows))
+    def scan(self, roots):
+        return scan_servers(roots)
 
-    def _finish(self, rows):
-        self.rows = rows
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(rows)} saved server entr{'y' if len(rows)==1 else 'ies'}.")
+    def done_message(self, rows):
+        return f"Found {plural(len(rows), 'saved server entry', 'saved server entries')}."
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for r in self.rows:
-            hay = f"{r['name']} {r['ip']} {r['profile']} {r['launcher']}".lower()
-            if f and f not in hay:
-                continue
-            self.tree.insert("", "end", values=(
-                r["launcher"], r["profile"], r["name"], r["ip"], r["source"]))
+    def row_values(self, r):
+        return (r["launcher"], r["profile"], r["name"], r["ip"], r["source"])
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["launcher", "profile", "server_name", "address", "source_file"])
-            for r in self.rows:
-                w.writerow([r["launcher"], r["profile"], r["name"], r["ip"], r["source"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def export_row(self, r):
+        return [r["launcher"], r["profile"], r["name"], r["ip"], r["source"]]
 
 
 # ---------------------------------------------------------------------------
 # Installed Programs tab
 # ---------------------------------------------------------------------------
-class InstalledProgramsTab(ttk.Frame):
-    COLUMNS = ("name", "version", "publisher", "install_date", "key_modified", "scope", "location")
+class InstalledProgramsTab(ScanTab):
+    NOTE = ("Reads the registry's list of installed programs (all users, 32-bit, "
+            "and current user). Programs that were uninstalled sometimes leave "
+            "their registry entry behind, so this can show software that's no "
+            "longer on the PC. \"Key modified\" is when the entry was last "
+            "written - click any column header to sort.")
+    COLUMNS = (("name", "Name", 260), ("version", "Version", 100), ("publisher", "Publisher", 170),
+               ("install_date", "Install date", 100), ("key_modified", "Key modified", 140),
+               ("scope", "Scope", 120), ("location", "Install location", 300))
+    STRETCH = "location"
+    SEARCH_KEYS = ("name", "publisher", "location")
+    EXPORT_HEADER = ["name", "version", "publisher", "install_date", "key_modified",
+                     "scope", "install_location"]
+    FILTER_WIDTH = 30
+    SORTABLE = True
+    SCAN_LABEL = "Scan installed programs"
+    BUSY_TEXT = "Reading installed programs from the registry..."
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.rows = []
-        self.sort_col = None
-        self.sort_reverse = False
-        self.worker = None
-        self._build_ui()
+    def scan(self):
+        return enumerate_installed_programs()
 
-    def _build_ui(self):
-        note = ("Reads the registry's list of installed programs (all users, 32-bit, "
-                "and current user). Programs that were uninstalled sometimes leave "
-                "their registry entry behind, so this can show software that's no "
-                "longer on the PC. \"Key modified\" is when the entry was last "
-                "written - click any column header to sort.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+    def done_message(self, rows):
+        return f"Found {plural(len(rows), 'installed program entry', 'installed program entries')}."
 
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan installed programs", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=30).pack(side="left")
-
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"name": 260, "version": 100, "publisher": 170, "install_date": 100,
-                  "key_modified": 140, "scope": 120, "location": 300}
-        labels = {"name": "Name", "version": "Version", "publisher": "Publisher",
-                  "install_date": "Install date", "key_modified": "Key modified",
-                  "scope": "Scope", "location": "Install location"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c], command=lambda col=c: self.sort_by(col))
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "location"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
-        self.scan_btn.config(state="disabled")
-        self.status.set("Reading installed programs from the registry...")
-        self.worker = threading.Thread(target=self._worker, daemon=True)
-        self.worker.start()
-
-    def _worker(self):
-        try:
-            rows = enumerate_installed_programs()
-        except Exception as exc:
-            rows = []
-            self.after(0, lambda: messagebox.showerror("Scan failed", str(exc)))
-        self.after(0, lambda: self._finish(rows))
-
-    def _finish(self, rows):
-        self.rows = rows
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(rows)} installed program entr{'y' if len(rows)==1 else 'ies'}.")
-
-    def _sort_key(self, r):
-        if self.sort_col == "key_modified":
+    def sort_key(self, r, col):
+        if col == "key_modified":
             return r["key_modified"] or datetime.min
-        return str(r[self.sort_col]).lower()
+        return str(r[col]).lower()
 
-    def sort_by(self, col):
-        if self.sort_col == col:
-            self.sort_reverse = not self.sort_reverse
-        else:
-            self.sort_col, self.sort_reverse = col, (col == "key_modified")
-        self.rows.sort(key=self._sort_key, reverse=self.sort_reverse)
-        self.apply_filter()
+    def sort_starts_descending(self, col):
+        return col == "key_modified"
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
-        for r in self.rows:
-            hay = f"{r['name']} {r['publisher']} {r['location']}".lower()
-            if f and f not in hay:
-                continue
-            self.tree.insert("", "end", values=(
-                r["name"], r["version"], r["publisher"], r["install_date"],
-                fmt_dt(r["key_modified"]), r["scope"], r["location"]))
+    def row_values(self, r):
+        return (r["name"], r["version"], r["publisher"], r["install_date"],
+                fmt_dt(r["key_modified"]), r["scope"], r["location"])
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["name", "version", "publisher", "install_date", "key_modified",
-                       "scope", "install_location"])
-            for r in self.rows:
-                w.writerow([r["name"], r["version"], r["publisher"], r["install_date"],
-                           fmt_dt(r["key_modified"]), r["scope"], r["location"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def export_row(self, r):
+        return list(self.row_values(r))
 
 
 # ---------------------------------------------------------------------------
 # Hosts Check tab
 # ---------------------------------------------------------------------------
-class HostsCheckTab(ttk.Frame):
-    COLUMNS = ("line", "ip", "host", "kind", "note")
+class HostsCheckTab(ScanTab):
+    NOTE = ("Reads the Windows hosts file. A stock hosts file has only comments, "
+            "so any active entry beyond localhost is worth a look. Entries that "
+            "point a domain at 0.0.0.0 / 127.0.0.1 block it; entries pointing "
+            "at another IP redirect it. Some cheat clients add entries to stop "
+            "anti-cheat or report domains from loading - but plenty of "
+            "legitimate software (ad blockers, dev tools) edits this file too, "
+            "so check what a flagged entry actually is before reading into it.")
+    COLUMNS = (("line", "Line", 60), ("ip", "IP", 140), ("host", "Hostname", 320),
+               ("kind", "Type", 200), ("note", "Note", 300))
+    STRETCH = "note"
+    EXPORT_HEADER = ["line", "ip", "hostname", "type", "note"]
+    EMPTY_EXPORT_TEXT = "Nothing to export yet. Run a check first."
+    SCAN_LABEL = "Check hosts file"
+    BUSY_TEXT = "Reading the hosts file..."
+    THREADED = False
+    HAS_FILTER = False
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
-        self.rows = []
-        self._build_ui()
-
-    def _build_ui(self):
-        note = ("Reads the Windows hosts file. A stock hosts file has only comments, "
-                "so any active entry beyond localhost is worth a look. Entries that "
-                "point a domain at 0.0.0.0 / 127.0.0.1 block it; entries pointing "
-                "at another IP redirect it. Some cheat clients add entries to stop "
-                "anti-cheat or report domains from loading - but plenty of "
-                "legitimate software (ad blockers, dev tools) edits this file too, "
-                "so check what a flagged entry actually is before reading into it.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
-
-        ctl = ttk.Frame(self)
-        ctl.pack(fill="x", pady=(8, 0))
-        ttk.Button(ctl, text="Check hosts file", command=self.check).pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+    def build_extra_controls(self, ctl):
         ttk.Label(ctl, text=f"File: {HOSTS_PATH}", foreground="gray").pack(side="left", padx=(16, 0))
 
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"line": 60, "ip": 140, "host": 320, "kind": 200, "note": 300}
-        labels = {"line": "Line", "ip": "IP", "host": "Hostname", "kind": "Type",
-                  "note": "Note"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "note"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
+    def scan(self):
+        self.result = parse_hosts_file()
+        return [] if self.result["error"] else self.result["rows"]
 
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def check(self):
-        result = parse_hosts_file()
-        self.tree.delete(*self.tree.get_children())
-        if result["error"]:
-            self.rows = []
-            self.status.set(f"Couldn't read the hosts file: {result['error']}")
-            return
-        self.rows = result["rows"]
-        for r in self.rows:
-            self.tree.insert("", "end", values=(r["line"], r["ip"], r["host"], r["kind"], r["note"]))
-        extra = [r for r in self.rows if r["kind"] != "default (localhost)"]
-        stamp = f"Last modified {fmt_dt(result['modified'])}, {result['size']} bytes."
+    def done_message(self, rows):
+        if self.result["error"]:
+            return f"Couldn't read the hosts file: {self.result['error']}"
+        extra = [r for r in rows if r["kind"] != "default (localhost)"]
+        stamp = f"Last modified {fmt_dt(self.result['modified'])}, {self.result['size']} bytes."
         if extra:
-            self.status.set(f"{len(extra)} active entr{'y' if len(extra)==1 else 'ies'} beyond "
-                            f"localhost. {stamp}")
-        else:
-            self.status.set(f"No active entries beyond localhost - looks clean. {stamp}")
+            return f"{plural(len(extra), 'active entry', 'active entries')} beyond localhost. {stamp}"
+        return f"No active entries beyond localhost - looks clean. {stamp}"
 
-    def export(self):
-        if not self.rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Run a check first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["line", "ip", "hostname", "type", "note"])
-            for r in self.rows:
-                w.writerow([r["line"], r["ip"], r["host"], r["kind"], r["note"]])
-        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+    def row_values(self, r):
+        return (r["line"], r["ip"], r["host"], r["kind"], r["note"])
+
+    def export_row(self, r):
+        return list(self.row_values(r))
 
 
 # ---------------------------------------------------------------------------
-# Process Timeline tab
+# Process Timeline tab (refreshes live instead of running a one-off scan, so it
+# sits on TableTab rather than ScanTab)
 # ---------------------------------------------------------------------------
-class ProcessTimelineTab(ttk.Frame):
-    COLUMNS = ("start", "delta", "pid", "name", "path")
+class ProcessTimelineTab(TableTab):
+    NOTE = ("Lists processes that started after a reference time (e.g. when "
+            "Minecraft launched). This only sees processes still running now "
+            "and whatever starts from here on - Windows doesn't keep deep launch "
+            "history by default.")
+    COLUMNS = (("start", "Started", 150), ("delta", "After ref. (s)", 90), ("pid", "PID", 70),
+               ("name", "Name", 220), ("path", "Path", 450))
+    STRETCH = "path"
+    EXPORT_HEADER = ["started", "seconds_after_reference", "pid", "name", "path"]
+    EMPTY_EXPORT_TEXT = "Nothing to export yet. Refresh first."
+    READY_TEXT = "Set a reference time to begin."
+    HAS_CONTROL_BAR = False       # this tab lays out its own controls in build_top
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=8)
+    def init_state(self):
         self.ref_epoch = None
         self.auto_job = None
-        self._build_ui()
+        self.java_proc_map = {}
 
-    def _build_ui(self):
-        note = ("Lists processes that started after a reference time (e.g. when "
-                "Minecraft launched). This only sees processes still running now "
-                "and whatever starts from here on - Windows doesn't keep deep launch "
-                "history by default.")
-        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+    def after_build(self):
+        self.refresh_java_list()
 
+    def build_top(self):
         ctl = ttk.Frame(self)
         ctl.pack(fill="x", pady=(8, 0))
         ttk.Button(ctl, text="Auto-detect (earliest match)", command=self.use_mc_launch
-                  ).pack(side="left")
+                   ).pack(side="left")
         ttk.Button(ctl, text="Use now", command=self.use_now).pack(side="left", padx=6)
         self.ref_label = ttk.Label(ctl, text="Reference time: not set")
         self.ref_label.pack(side="left", padx=(12, 0))
@@ -2224,40 +2244,24 @@ class ProcessTimelineTab(ttk.Frame):
         ttk.Checkbutton(ctl2, text="Auto-refresh every", variable=self.auto_var,
                         command=self._toggle_auto).pack(side="left")
         self.interval = tk.IntVar(value=5)
-        ttk.Spinbox(ctl2, from_=2, to=60, textvariable=self.interval, width=4
-                   ).pack(side="left")
+        ttk.Spinbox(ctl2, from_=2, to=60, textvariable=self.interval, width=4).pack(side="left")
         ttk.Label(ctl2, text="sec").pack(side="left", padx=(2, 12))
         ttk.Button(ctl2, text="Refresh now", command=self.refresh).pack(side="left")
         ttk.Button(ctl2, text="Export...", command=self.export).pack(side="left", padx=6)
 
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"start": 150, "delta": 90, "pid": 70, "name": 220, "path": 450}
-        labels = {"start": "Started", "delta": "After ref. (s)", "pid": "PID",
-                  "name": "Name", "path": "Path"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "path"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
+    def row_values(self, r):
+        return (fmt_dt(r["start"]), f"{r['delta']:.1f}", r["pid"], r["name"], r["exe"])
 
-        self.status = tk.StringVar(value="Set a reference time to begin.")
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-        self.java_proc_map = {}
-        self.refresh_java_list()
+    def export_row(self, r):
+        return list(self.row_values(r))
 
     def refresh_java_list(self):
         if not psutil:
-            self.status.set("psutil unavailable - can't list processes.")
+            self.set_status("psutil unavailable - can't list processes.")
             return
-        cands = list_java_candidates()
         self.java_proc_map = {}
         labels = []
-        for pid, name, ct in cands:
+        for pid, name, ct in list_java_candidates():
             label = f"{name}  (PID {pid})  started {datetime.fromtimestamp(ct).strftime('%H:%M:%S')}"
             self.java_proc_map[label] = (pid, ct)
             labels.append(label)
@@ -2266,7 +2270,12 @@ class ProcessTimelineTab(ttk.Frame):
             self.java_combo.current(0)
         else:
             self.java_var.set("")
-        self.status.set(f"Found {len(labels)} java/client process(es) to choose from.")
+        self.set_status(f"Found {len(labels)} java/client process(es) to choose from.")
+
+    def _set_reference(self, epoch, how):
+        self.ref_epoch = epoch
+        self.ref_label.config(text=f"Reference time: {fmt_dt(datetime.fromtimestamp(epoch))} ({how})")
+        self.refresh()
 
     def use_selected_java(self):
         info = self.java_proc_map.get(self.java_var.get())
@@ -2275,10 +2284,7 @@ class ProcessTimelineTab(ttk.Frame):
                                    "(click Refresh list if it's empty).")
             return
         pid, ct = info
-        self.ref_epoch = ct
-        self.ref_label.config(
-            text=f"Reference time: {fmt_dt(datetime.fromtimestamp(ct))} (PID {pid}, picked manually)")
-        self.refresh()
+        self._set_reference(ct, f"PID {pid}, picked manually")
 
     def use_mc_launch(self):
         if not psutil:
@@ -2290,27 +2296,18 @@ class ProcessTimelineTab(ttk.Frame):
                                 "javaw / java / minecraft / lunar / badlion. "
                                 "Launch Minecraft first, or use 'Use now' instead.")
             return
-        self.ref_epoch = t
-        self.ref_label.config(text=f"Reference time: {fmt_dt(datetime.fromtimestamp(t))} (Minecraft launch)")
-        self.refresh()
+        self._set_reference(t, "Minecraft launch")
 
     def use_now(self):
-        self.ref_epoch = datetime.now().timestamp()
-        self.ref_label.config(text=f"Reference time: {fmt_dt(datetime.fromtimestamp(self.ref_epoch))} (manual)")
-        self.refresh()
+        self._set_reference(datetime.now().timestamp(), "manual")
 
     def refresh(self):
         if self.ref_epoch is None:
-            self.status.set("Set a reference time first.")
+            self.set_status("Set a reference time first.")
             return
-        rows = list_processes_since(self.ref_epoch)
-        self.tree.delete(*self.tree.get_children())
-        for r in rows:
-            self.tree.insert("", "end", values=(
-                fmt_dt(r["start"]), f"{r['delta']:.1f}", r["pid"], r["name"], r["exe"]))
-        self.status.set(f"{len(rows)} process(es) started after the reference time. "
+        self.set_rows(list_processes_since(self.ref_epoch))
+        self.set_status(f"{len(self.rows)} process(es) started after the reference time. "
                         f"Last refreshed {datetime.now().strftime('%H:%M:%S')}.")
-        self._last_rows = rows
 
     def _toggle_auto(self):
         if self.auto_var.get():
@@ -2324,106 +2321,43 @@ class ProcessTimelineTab(ttk.Frame):
         if self.auto_var.get():
             self.auto_job = self.after(max(2, self.interval.get()) * 1000, self._auto_tick)
 
-    def export(self):
-        rows = getattr(self, "_last_rows", [])
-        if not rows:
-            messagebox.showinfo("Export", "Nothing to export yet. Refresh first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["started", "seconds_after_reference", "pid", "name", "path"])
-            for r in rows:
-                w.writerow([fmt_dt(r["start"]), f"{r['delta']:.1f}", r["pid"], r["name"], r["exe"]])
-        self.status.set(f"Exported {len(rows)} rows to {path}")
-
 
 # ---------------------------------------------------------------------------
-# Log Checker tab
+# Log Checker tab = two ScanTab panels (usernames in logs, launcher accounts)
+# stacked inside one scrollable page.
 # ---------------------------------------------------------------------------
-class LogCheckerTab(ttk.Frame):
-    COLUMNS = ("username", "likely_you", "count", "files", "first_time", "sample")
-    ACCOUNT_COLUMNS = ("source", "name")
+class LogsPanel(ScanTab):
+    NOTE = ("Scans Minecraft-style log files for usernames seen joining, "
+            "leaving, or chatting, and lists each unique one under Possible "
+            "Alts below. This only reads log files already on disk. Your own "
+            "username (from \"Setting user: ...\" lines) is auto-detected and "
+            "excluded, so chat lines from you aren't mistaken for an alt.")
+    COLUMNS = (("username", "Username", 150), ("likely_you", "Likely you?", 80),
+               ("count", "Occurrences", 80), ("files", "Seen in file(s)", 200),
+               ("first_time", "First match time", 100), ("sample", "Sample log line", 360))
+    STRETCH = "sample"
+    EXPORT_HEADER = ["username", "likely_you", "occurrences", "files", "first_time", "sample_line"]
+    PADDING = 0
+    TABLE_TITLE = "Possible alts (other players seen in logs)"
+    TABLE_HEIGHT = 260
+    SCAN_LABEL = "Scan logs"
+    BUSY_TEXT = "Scanning log files..."
+    ERROR_TITLE = "Log scan failed"
+    HAS_PROGRESS = True
 
-    def __init__(self, parent):
-        super().__init__(parent, padding=0)
-        self.default_paths = get_default_log_paths()
-        self.default_vars = {}  # label -> (BooleanVar, path)
-        self.custom_paths = []
-        self.results = {}
-        self.local_names = set()
-        self.worker = None
-        self.stop_event = threading.Event()
+    def init_state(self):
+        super().init_state()
+        self.local_names = set()            # names shown as "likely you"
+        self.pending_local_names = set()    # set by the worker, applied in on_scan_done
 
-        self.default_account_paths = get_default_account_files()
-        self.account_default_vars = {}
-        self.custom_account_paths = []
-        self.account_results = {}
-        self.account_worker = None
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, "Log locations", defaults=get_default_log_paths(), list_height=4,
+            default_caption="Default paths (unchecked ones weren't found on this PC):",
+            custom_caption="Custom path (for clients that don't keep logs in .minecraft):",
+            empty_text="(%APPDATA% not available)")
 
-        self._build_scroll_container()
-        self._build_log_section(self.body)
-        self._build_accounts_section(self.body)
-
-    def _build_scroll_container(self):
-        self.scroll_canvas = tk.Canvas(self, highlightthickness=0)
-        canvas = self.scroll_canvas
-        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        self.body = ttk.Frame(canvas, padding=8)
-        self.body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.body, anchor="nw")
-        canvas.configure(yscrollcommand=vsb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        def on_wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", on_wheel, add="+")
-
-    def _build_log_section(self, root):
-        note = ("Scans Minecraft-style log files for usernames seen joining, "
-                "leaving, or chatting, and lists each unique one under Possible "
-                "Alts below. This only reads log files already on disk. Your own "
-                "username (from \"Setting user: ...\" lines) is auto-detected and "
-                "excluded, so chat lines from you aren't mistaken for an alt.")
-        ttk.Label(root, text=note, wraplength=1000, foreground="gray").pack(fill="x")
-
-        paths_frame = ttk.LabelFrame(root, text="Log locations", padding=8)
-        paths_frame.pack(fill="x", pady=(8, 0))
-
-        df = ttk.Frame(paths_frame)
-        df.pack(fill="x")
-        ttk.Label(df, text="Default paths (unchecked ones weren't found on this PC):"
-                  ).pack(anchor="w")
-        if not self.default_paths:
-            ttk.Label(df, text="(%APPDATA% not available)", foreground="gray").pack(anchor="w")
-        for label, path in self.default_paths:
-            exists = os.path.isdir(path)
-            var = tk.BooleanVar(value=exists)
-            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
-            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
-            self.default_vars[label] = (var, path)
-
-        cf = ttk.Frame(paths_frame)
-        cf.pack(fill="x", pady=(10, 0))
-        ttk.Label(cf, text="Custom path (for clients that don't keep logs in .minecraft):"
-                  ).pack(anchor="w")
-        row = ttk.Frame(cf)
-        row.pack(fill="x")
-        self.custom_entry = tk.StringVar()
-        ttk.Entry(row, textvariable=self.custom_entry, width=70).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse...", command=self.browse_path).pack(side="left", padx=4)
-        ttk.Button(row, text="Add", command=self.add_custom_path).pack(side="left")
-        self.custom_list = tk.Listbox(cf, height=4)
-        self.custom_list.pack(fill="x", pady=(4, 0))
-        ttk.Button(cf, text="Remove selected", command=self.remove_custom_path
-                  ).pack(anchor="w", pady=(4, 0))
-
-        ef = ttk.Frame(root)
+        ef = ttk.Frame(self)
         ef.pack(fill="x", pady=(8, 0))
         ttk.Label(ef, text="Also exclude (comma-separated - friends, teammates, etc.):"
                   ).pack(anchor="w")
@@ -2438,272 +2372,136 @@ class LogCheckerTab(ttk.Frame):
                                            foreground="gray")
         self.local_names_label.pack(anchor="w")
 
-        ctl = ttk.Frame(root)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.scan_btn = ttk.Button(ctl, text="Scan logs", command=self.start_scan)
-        self.scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
-        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
-        self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
-        ttk.Entry(ctl, textvariable=self.filter_var, width=25).pack(side="left")
-        self.progress = ttk.Progressbar(ctl, length=200, maximum=100)
-        self.progress.pack(side="right")
-
-        mid = ttk.LabelFrame(root, text="Possible alts (other players seen in logs)", padding=4)
-        mid.pack(fill="both", expand=True, pady=(8, 0))
-        mid.configure(height=260)
-        mid.pack_propagate(False)
-        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
-        widths = {"username": 150, "likely_you": 80, "count": 80, "files": 200,
-                  "first_time": 100, "sample": 360}
-        labels = {"username": "Username", "likely_you": "Likely you?", "count": "Occurrences",
-                  "files": "Seen in file(s)", "first_time": "First match time",
-                  "sample": "Sample log line"}
-        for c in self.COLUMNS:
-            self.tree.heading(c, text=labels[c])
-            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "sample"))
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="left", fill="y")
-
-        self.status = tk.StringVar(value="Ready.")
-        ttk.Label(root, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def browse_path(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.custom_entry.set(path)
-
-    def add_custom_path(self):
-        path = self.custom_entry.get().strip()
-        if path and path not in self.custom_paths:
-            self.custom_paths.append(path)
-            self.custom_list.insert("end", path)
-        self.custom_entry.set("")
-
-    def remove_custom_path(self):
-        for i in reversed(self.custom_list.curselection()):
-            del self.custom_paths[i]
-            self.custom_list.delete(i)
-
-    def start_scan(self):
-        if self.worker and self.worker.is_alive():
-            return
-        paths = [path for (var, path) in self.default_vars.values() if var.get()]
-        paths += list(self.custom_paths)
+    # ---- scanning ----------------------------------------------------------
+    def prepare_scan(self):
+        paths = [path for _label, path in self.picker.selected()]
         if not paths:
             messagebox.showwarning("No paths", "Select at least one default path or add a custom one.")
-            return
-        self.stop_event.clear()
-        self.progress["value"] = 0
-        self.scan_btn.config(state="disabled")
-        self.status.set("Scanning log files...")
-        self.worker = threading.Thread(target=self._worker, args=(paths,), daemon=True)
-        self.worker.start()
+            return None
+        return (paths,)
 
-    def _worker(self, paths):
-        def on_progress(pct):
-            self.after(0, lambda: self.progress.configure(value=pct))
-        try:
-            agg, local_names = scan_logs(paths, self.stop_event, on_progress)
-        except Exception as exc:
-            agg, local_names = {}, set()
-            self.after(0, lambda: messagebox.showerror("Log scan failed", str(exc)))
-        self.after(0, lambda: self._finish(agg, local_names))
+    def scan(self, paths):
+        self.pending_local_names = set()
+        agg, local_names = scan_logs(paths, self.stop_event, self.report_progress)
+        self.pending_local_names = local_names
+        rows = [{"name": name, **info} for name, info in agg.items()]
+        rows.sort(key=lambda r: -r["count"])
+        return rows
 
-    def _finish(self, agg, local_names):
-        self.results = agg
-        self.local_names = local_names
-        if local_names:
+    def on_scan_done(self, rows):
+        self.local_names = self.pending_local_names
+        if self.local_names:
             self.local_names_label.config(
-                text="Detected local account(s): " + ", ".join(sorted(local_names)),
+                text="Detected local account(s): " + ", ".join(sorted(self.local_names)),
                 foreground="black")
         else:
             self.local_names_label.config(
                 text="Detected local account(s): none found (no \"Setting user:\" line in these logs)",
                 foreground="gray")
-        self.apply_filter()
-        self.scan_btn.config(state="normal")
-        self.status.set(f"Found {len(agg)} unique username(s) across the scanned logs.")
 
+    def done_message(self, rows):
+        return f"Found {len(rows)} unique username(s) across the scanned logs."
+
+    # ---- filtering / display ----------------------------------------------
     def _excluded_set(self):
         manual = {n.strip().lower() for n in self.exclude_var.get().split(",") if n.strip()}
         if self.auto_exclude_local.get():
             manual |= {n.lower() for n in self.local_names}
         return manual
 
-    def apply_filter(self):
-        self.tree.delete(*self.tree.get_children())
-        f = self.filter_var.get().strip().lower()
+    def visible_rows(self):
+        f = self.current_filter()
         excluded = self._excluded_set()
-        local_lower = {n.lower() for n in self.local_names}
-        for name, info in sorted(self.results.items(), key=lambda kv: -kv[1]["count"]):
-            if name.lower() in excluded:
-                continue
-            if f and f not in name.lower():
-                continue
-            likely_you = "yes" if name.lower() in local_lower else ""
-            self.tree.insert("", "end", values=(
-                name, likely_you, info["count"], ", ".join(sorted(info["files"])),
-                info["first_time"], info["sample"][:200]))
+        return [r for r in self.rows
+                if r["name"].lower() not in excluded and (not f or f in r["name"].lower())]
 
-    def export(self):
-        if not self.results:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
+    def export_rows(self):
         excluded = self._excluded_set()
-        local_lower = {n.lower() for n in self.local_names}
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["username", "likely_you", "occurrences", "files", "first_time", "sample_line"])
-            for name, info in sorted(self.results.items(), key=lambda kv: -kv[1]["count"]):
-                if name.lower() in excluded:
-                    continue
-                w.writerow([name, "yes" if name.lower() in local_lower else "",
-                           info["count"], ", ".join(sorted(info["files"])),
-                           info["first_time"], info["sample"]])
-        self.status.set(f"Exported to {path}")
+        return [r for r in self.rows if r["name"].lower() not in excluded]
 
-    # ---- Launcher accounts / profile names --------------------------------
-    def _build_accounts_section(self, root):
-        frame = ttk.LabelFrame(root, text="Launcher accounts / profile names", padding=8)
-        frame.pack(fill="x", pady=(16, 0))
+    def _likely_you(self, r):
+        return "yes" if r["name"].lower() in {n.lower() for n in self.local_names} else ""
 
-        note = ("Reads profile/display names out of launcher account files already "
-                "on this PC - i.e. which accounts are logged into which launcher. "
-                "Only names are shown; access tokens, passwords, and other "
-                "credential-looking values are never read out, whatever the file "
-                "contains.")
-        ttk.Label(frame, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+    def row_values(self, r):
+        return (r["name"], self._likely_you(r), r["count"], ", ".join(sorted(r["files"])),
+                r["first_time"], r["sample"][:200])
 
-        df = ttk.Frame(frame)
-        df.pack(fill="x", pady=(8, 0))
-        ttk.Label(df, text="Default launcher files (unchecked ones weren't found):"
-                  ).pack(anchor="w")
-        if not self.default_account_paths:
-            ttk.Label(df, text="(%APPDATA% not available)", foreground="gray").pack(anchor="w")
-        for label, path in self.default_account_paths:
-            exists = os.path.isfile(path)
-            var = tk.BooleanVar(value=exists)
-            text = f"{label}   ({path})" + ("" if exists else "   [not found]")
-            ttk.Checkbutton(df, text=text, variable=var).pack(anchor="w")
-            self.account_default_vars[label] = (var, path)
+    def export_row(self, r):
+        return [r["name"], self._likely_you(r), r["count"], ", ".join(sorted(r["files"])),
+                r["first_time"], r["sample"]]
 
-        cf = ttk.Frame(frame)
-        cf.pack(fill="x", pady=(10, 0))
-        ttk.Label(cf, text="Custom account/profile file (e.g. another launcher's accounts.json):"
-                  ).pack(anchor="w")
-        row = ttk.Frame(cf)
-        row.pack(fill="x")
-        self.custom_account_entry = tk.StringVar()
-        ttk.Entry(row, textvariable=self.custom_account_entry, width=70).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse...", command=self.browse_account_file).pack(side="left", padx=4)
-        ttk.Button(row, text="Add", command=self.add_custom_account_path).pack(side="left")
-        self.custom_account_list = tk.Listbox(cf, height=3)
-        self.custom_account_list.pack(fill="x", pady=(4, 0))
-        ttk.Button(cf, text="Remove selected", command=self.remove_custom_account_path
-                  ).pack(anchor="w", pady=(4, 0))
 
-        ctl = ttk.Frame(frame)
-        ctl.pack(fill="x", pady=(8, 0))
-        self.account_scan_btn = ttk.Button(ctl, text="Scan accounts", command=self.start_account_scan)
-        self.account_scan_btn.pack(side="left")
-        ttk.Button(ctl, text="Export...", command=self.export_accounts).pack(side="left", padx=6)
+class AccountsPanel(ScanTab):
+    NOTE = ("Reads profile/display names out of launcher account files already "
+            "on this PC - i.e. which accounts are logged into which launcher. "
+            "Only names are shown; access tokens, passwords, and other "
+            "credential-looking values are never read out, whatever the file "
+            "contains.")
+    COLUMNS = (("source", "Launcher file", 480), ("name", "Profile / display name", 260))
+    STRETCH = "source"
+    EXPORT_HEADER = ["source_file", "profile_name"]
+    PADDING = 0
+    TABLE_HEIGHT = 160
+    TABLE_EXPAND = False
+    SCAN_LABEL = "Scan accounts"
+    BUSY_TEXT = "Scanning launcher account files..."
+    ERROR_TITLE = "Account scan failed"
+    HAS_FILTER = False
 
-        mid = ttk.Frame(frame)
-        mid.pack(fill="both", pady=(8, 0))
-        mid.configure(height=160)
-        mid.pack_propagate(False)
-        self.account_tree = ttk.Treeview(mid, columns=self.ACCOUNT_COLUMNS, show="headings")
-        self.account_tree.heading("source", text="Launcher file")
-        self.account_tree.heading("name", text="Profile / display name")
-        self.account_tree.column("source", width=480, anchor="w")
-        self.account_tree.column("name", width=260, anchor="w")
-        asb = ttk.Scrollbar(mid, orient="vertical", command=self.account_tree.yview)
-        self.account_tree.configure(yscrollcommand=asb.set)
-        self.account_tree.pack(side="left", fill="both", expand=True)
-        asb.pack(side="left", fill="y")
+    def build_top(self):
+        self.picker = PathPicker(
+            self, defaults=get_default_account_files(), files=True,
+            default_caption="Default launcher files (unchecked ones weren't found):",
+            custom_caption="Custom account/profile file (e.g. another launcher's accounts.json):",
+            empty_text="(%APPDATA% not available)")
+        self.picker.pack(fill="x", pady=(8, 0))
 
-        self.account_status = tk.StringVar(value="Ready.")
-        ttk.Label(frame, textvariable=self.account_status, anchor="w").pack(fill="x", pady=(8, 0))
-
-    def browse_account_file(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json"), ("All", "*.*")])
-        if path:
-            self.custom_account_entry.set(path)
-
-    def add_custom_account_path(self):
-        path = self.custom_account_entry.get().strip()
-        if path and path not in self.custom_account_paths:
-            self.custom_account_paths.append(path)
-            self.custom_account_list.insert("end", path)
-        self.custom_account_entry.set("")
-
-    def remove_custom_account_path(self):
-        for i in reversed(self.custom_account_list.curselection()):
-            del self.custom_account_paths[i]
-            self.custom_account_list.delete(i)
-
-    def start_account_scan(self):
-        if self.account_worker and self.account_worker.is_alive():
-            return
-        paths = [path for (var, path) in self.account_default_vars.values() if var.get()]
-        paths += list(self.custom_account_paths)
+    def prepare_scan(self):
+        paths = [path for _label, path in self.picker.selected()]
         if not paths:
             messagebox.showwarning("No files", "Select at least one default file or add a custom one.")
-            return
-        self.account_scan_btn.config(state="disabled")
-        self.account_status.set("Scanning launcher account files...")
-        self.account_worker = threading.Thread(target=self._account_worker, args=(paths,), daemon=True)
-        self.account_worker.start()
+            return None
+        return (paths,)
 
-    def _account_worker(self, paths):
-        try:
-            result = scan_account_files(paths)
-        except Exception as exc:
-            result = {}
-            self.after(0, lambda: messagebox.showerror("Account scan failed", str(exc)))
-        self.after(0, lambda: self._account_finish(result))
+    def scan(self, paths):
+        result = scan_account_files(paths)
+        self.file_count = len(result)
+        return [{"source": src, "name": name} for src, names in result.items() for name in sorted(names)]
 
-    def _account_finish(self, result):
-        self.account_results = result
-        self.account_tree.delete(*self.account_tree.get_children())
-        total_names = 0
-        for path, names in result.items():
-            for name in sorted(names):
-                self.account_tree.insert("", "end", values=(path, name))
-                total_names += 1
-        self.account_scan_btn.config(state="normal")
-        self.account_status.set(
-            f"Found {total_names} profile name(s) across {len(result)} file(s).")
+    def done_message(self, rows):
+        return f"Found {len(rows)} profile name(s) across {self.file_count} file(s)."
 
-    def export_accounts(self):
-        if not self.account_results:
-            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["source_file", "profile_name"])
-            for source, names in self.account_results.items():
-                for name in sorted(names):
-                    w.writerow([source, name])
-        self.account_status.set(f"Exported to {path}")
+    def row_values(self, r):
+        return (r["source"], r["name"])
+
+    def export_row(self, r):
+        return [r["source"], r["name"]]
 
 
-# ---------------------------------------------------------------------------
-# Credits tab
-# ---------------------------------------------------------------------------
+class LogCheckerTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padding=0)
+        self.scroll_canvas = tk.Canvas(self, highlightthickness=0)
+        canvas = self.scroll_canvas
+        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas, padding=8)
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"), add="+")
+
+        self.logs = LogsPanel(body)
+        self.logs.pack(fill="both", expand=True)
+
+        box = ttk.LabelFrame(body, text="Launcher accounts / profile names", padding=8)
+        box.pack(fill="x", pady=(16, 0))
+        self.accounts = AccountsPanel(box)
+        self.accounts.pack(fill="x")
+
+
 class CreditsTab(ttk.Frame):
     NAMES = [
         "Scarf",
@@ -2729,6 +2527,21 @@ LIGHT_COLORS = dict(bg="#f0f0f0", fg="#000000", field_bg="#ffffff", select="#339
                     select_fg="#ffffff")
 DARK_COLORS = dict(bg="#1e1e1e", fg="#e6e6e6", field_bg="#2b2b2b", select="#3a6ea5",
                    select_fg="#ffffff")
+
+# (tab title, tab class) in display order - add a new tab by adding a line here.
+TABS = [
+    ("Memory Scan", MemoryScanTab),
+    ("DLL Scanner", DLLScannerTab),
+    ("Log Checker", LogCheckerTab),
+    ("Mods Scanner", ModsScannerTab),
+    ("Servers", ServersTab),
+    ("Recycle Bin", RecycleBinTab),
+    ("Prefetch", PrefetchTab),
+    ("Installed Programs", InstalledProgramsTab),
+    ("Hosts Check", HostsCheckTab),
+    ("Process Timeline", ProcessTimelineTab),
+    ("Credits", CreditsTab),
+]
 
 
 class App(tk.Tk):
@@ -2759,30 +2572,11 @@ class App(tk.Tk):
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
-
-        self.scan_tab = MemoryScanTab(nb)
-        self.dll_tab = DLLScannerTab(nb)
-        self.log_tab = LogCheckerTab(nb)
-        self.mods_tab = ModsScannerTab(nb)
-        self.servers_tab = ServersTab(nb)
-        self.recycle_tab = RecycleBinTab(nb)
-        self.prefetch_tab = PrefetchTab(nb)
-        self.programs_tab = InstalledProgramsTab(nb)
-        self.hosts_tab = HostsCheckTab(nb)
-        self.timeline_tab = ProcessTimelineTab(nb)
-        self.credits_tab = CreditsTab(nb)
-
-        nb.add(self.scan_tab, text="Memory Scan")
-        nb.add(self.dll_tab, text="DLL Scanner")
-        nb.add(self.log_tab, text="Log Checker")
-        nb.add(self.mods_tab, text="Mods Scanner")
-        nb.add(self.servers_tab, text="Servers")
-        nb.add(self.recycle_tab, text="Recycle Bin")
-        nb.add(self.prefetch_tab, text="Prefetch")
-        nb.add(self.programs_tab, text="Installed Programs")
-        nb.add(self.hosts_tab, text="Hosts Check")
-        nb.add(self.timeline_tab, text="Process Timeline")
-        nb.add(self.credits_tab, text="Credits")
+        self.tabs = {}
+        for title, tab_class in TABS:
+            tab = tab_class(nb)
+            nb.add(tab, text=title)
+            self.tabs[title] = tab
 
         self._apply_theme(LIGHT_COLORS, self.light_theme)
 
@@ -2804,7 +2598,7 @@ class App(tk.Tk):
         s.theme_use(theme_name)
         s.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field_bg"])
         for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
-                    "TCheckbutton", "TNotebook"):
+                     "TCheckbutton", "TNotebook"):
             s.configure(name, background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("TButton", background=c["field_bg"], foreground=c["fg"])
@@ -2812,40 +2606,40 @@ class App(tk.Tk):
         s.configure("TEntry", fieldbackground=c["field_bg"], foreground=c["fg"])
         s.configure("TSpinbox", fieldbackground=c["field_bg"], foreground=c["fg"])
         s.configure("TCombobox", fieldbackground=c["field_bg"], foreground=c["fg"],
-                   background=c["field_bg"])
+                    background=c["field_bg"])
         s.map("TCombobox", fieldbackground=[("readonly", c["field_bg"])],
-             foreground=[("readonly", c["fg"])])
+              foreground=[("readonly", c["fg"])])
         s.configure("TNotebook.Tab", background=c["field_bg"], foreground=c["fg"])
         s.map("TNotebook.Tab", background=[("selected", c["select"])],
-             foreground=[("selected", c["select_fg"])])
+              foreground=[("selected", c["select_fg"])])
         s.configure("Treeview", background=c["field_bg"], fieldbackground=c["field_bg"],
-                   foreground=c["fg"])
+                    foreground=c["fg"])
         s.configure("Treeview.Heading", background=c["bg"], foreground=c["fg"])
         s.map("Treeview", background=[("selected", c["select"])],
-             foreground=[("selected", c["select_fg"])])
+              foreground=[("selected", c["select_fg"])])
         s.configure("Horizontal.TProgressbar", background=c["select"])
 
         self.configure(bg=c["bg"])
-        self._recolor_classic_widgets(c)
+        self._recolor_classic_widgets(self, c)
 
-    def _recolor_classic_widgets(self, c):
-        """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas) - do those by hand."""
-        text_like = [self.scan_tab.kw_text, self.scan_tab.detail]
-        list_like = [self.log_tab.custom_list, self.log_tab.custom_account_list,
-                    self.mods_tab.custom_list, self.servers_tab.custom_list]
-        canvases = [self.log_tab.scroll_canvas]
-        for w in text_like + list_like:
+    def _recolor_classic_widgets(self, widget, c):
+        """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas), so walk the
+        whole widget tree and recolor those by hand. New tabs get this for free."""
+        for child in widget.winfo_children():
             try:
-                w.configure(bg=c["field_bg"], fg=c["fg"], insertbackground=c["fg"],
-                           selectbackground=c["select"], selectforeground=c["select_fg"],
-                           highlightthickness=0)
+                if isinstance(child, tk.Text):
+                    child.configure(bg=c["field_bg"], fg=c["fg"], insertbackground=c["fg"],
+                                    selectbackground=c["select"], selectforeground=c["select_fg"],
+                                    highlightthickness=0)
+                elif isinstance(child, tk.Listbox):      # Listbox has no insertbackground option
+                    child.configure(bg=c["field_bg"], fg=c["fg"],
+                                    selectbackground=c["select"], selectforeground=c["select_fg"],
+                                    highlightthickness=0)
+                elif isinstance(child, tk.Canvas):
+                    child.configure(bg=c["bg"])
             except tk.TclError:
                 pass
-        for w in canvases:
-            try:
-                w.configure(bg=c["bg"])
-            except tk.TclError:
-                pass
+            self._recolor_classic_widgets(child, c)
 
 
 if __name__ == "__main__":
