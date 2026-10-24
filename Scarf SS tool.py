@@ -77,6 +77,7 @@ import re
 import string
 import struct
 import threading
+import winreg
 from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
@@ -522,6 +523,114 @@ def list_processes_since(ref_epoch):
             })
     rows.sort(key=lambda r: r["start"])
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Installed programs (registry Uninstall keys)
+# ---------------------------------------------------------------------------
+UNINSTALL_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+
+
+def _reg_value(key, name):
+    try:
+        value, _ = winreg.QueryValueEx(key, name)
+        return str(value) if value is not None else ""
+    except OSError:
+        return ""
+
+
+def _fmt_install_date(raw):
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw
+
+
+def enumerate_installed_programs():
+    """Read every Uninstall key (64-bit, 32-bit, and per-user). Stale keys left
+    behind by uninstalled programs still show up here, which is the point."""
+    sources = [
+        (winreg.HKEY_LOCAL_MACHINE, "All users (64-bit)", winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, "All users (32-bit)", winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_CURRENT_USER, "Current user", 0),
+    ]
+    rows = []
+    for hive, scope, flag in sources:
+        try:
+            root = winreg.OpenKey(hive, UNINSTALL_PATH, 0, winreg.KEY_READ | flag)
+        except OSError:
+            continue
+        with root:
+            count = winreg.QueryInfoKey(root)[0]
+            for i in range(count):
+                try:
+                    sub_name = winreg.EnumKey(root, i)
+                    with winreg.OpenKey(root, sub_name) as sub:
+                        name = _reg_value(sub, "DisplayName")
+                        if not name:
+                            continue
+                        rows.append({
+                            "name": name,
+                            "version": _reg_value(sub, "DisplayVersion"),
+                            "publisher": _reg_value(sub, "Publisher"),
+                            "install_date": _fmt_install_date(_reg_value(sub, "InstallDate")),
+                            "location": _reg_value(sub, "InstallLocation"),
+                            "key_modified": filetime_to_datetime(winreg.QueryInfoKey(sub)[2]),
+                            "scope": scope,
+                        })
+                except OSError:
+                    continue
+    rows.sort(key=lambda r: r["name"].lower())
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Hosts file check
+# ---------------------------------------------------------------------------
+HOSTS_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                          r"System32\drivers\etc\hosts")
+LOOPBACK_IPS = {"0.0.0.0", "127.0.0.1", "::1", "::", "127.0.0.2"}
+HOSTS_WATCH_HINTS = ("mojang", "minecraft", "microsoft", "xboxlive", "xbox", "hypixel",
+                     "anticheat", "anti-cheat", "easyanticheat", "battleye", "sentry",
+                     "telemetry", "report", "verify", "auth")
+
+
+def parse_hosts_file(path=HOSTS_PATH):
+    """Returns {'rows': [...], 'error': str|None, 'modified': datetime|None, 'size': int}.
+    Each row: line number, ip, host, kind, note. The stock hosts file has only
+    comments, so any active entry beyond localhost is worth a look."""
+    result = {"rows": [], "error": None, "modified": None, "size": 0}
+    try:
+        st = os.stat(path)
+        result["modified"] = datetime.fromtimestamp(st.st_mtime)
+        result["size"] = st.st_size
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
+
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        ip, hosts = parts[0], parts[1:]
+        for host in hosts:
+            hl = host.lower()
+            if hl == "localhost":
+                kind = "default (localhost)"
+            elif ip in LOOPBACK_IPS:
+                kind = "blocks (points to loopback)"
+            else:
+                kind = "redirects to another IP"
+            note = ""
+            if kind != "default (localhost)" and any(h in hl for h in HOSTS_WATCH_HINTS):
+                note = "Minecraft / anti-cheat / auth related name"
+            result["rows"].append({"line": lineno, "ip": ip, "host": host,
+                                   "kind": kind, "note": note})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1879,6 +1988,199 @@ class ServersTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Installed Programs tab
+# ---------------------------------------------------------------------------
+class InstalledProgramsTab(ttk.Frame):
+    COLUMNS = ("name", "version", "publisher", "install_date", "key_modified", "scope", "location")
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.rows = []
+        self.sort_col = None
+        self.sort_reverse = False
+        self.worker = None
+        self._build_ui()
+
+    def _build_ui(self):
+        note = ("Reads the registry's list of installed programs (all users, 32-bit, "
+                "and current user). Programs that were uninstalled sometimes leave "
+                "their registry entry behind, so this can show software that's no "
+                "longer on the PC. \"Key modified\" is when the entry was last "
+                "written - click any column header to sort.")
+        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x", pady=(8, 0))
+        self.scan_btn = ttk.Button(ctl, text="Scan installed programs", command=self.start_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
+        ttk.Entry(ctl, textvariable=self.filter_var, width=30).pack(side="left")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
+        widths = {"name": 260, "version": 100, "publisher": 170, "install_date": 100,
+                  "key_modified": 140, "scope": 120, "location": 300}
+        labels = {"name": "Name", "version": "Version", "publisher": "Publisher",
+                  "install_date": "Install date", "key_modified": "Key modified",
+                  "scope": "Scope", "location": "Install location"}
+        for c in self.COLUMNS:
+            self.tree.heading(c, text=labels[c], command=lambda col=c: self.sort_by(col))
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "location"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def start_scan(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.scan_btn.config(state="disabled")
+        self.status.set("Reading installed programs from the registry...")
+        self.worker = threading.Thread(target=self._worker, daemon=True)
+        self.worker.start()
+
+    def _worker(self):
+        try:
+            rows = enumerate_installed_programs()
+        except Exception as exc:
+            rows = []
+            self.after(0, lambda: messagebox.showerror("Scan failed", str(exc)))
+        self.after(0, lambda: self._finish(rows))
+
+    def _finish(self, rows):
+        self.rows = rows
+        self.apply_filter()
+        self.scan_btn.config(state="normal")
+        self.status.set(f"Found {len(rows)} installed program entr{'y' if len(rows)==1 else 'ies'}.")
+
+    def _sort_key(self, r):
+        if self.sort_col == "key_modified":
+            return r["key_modified"] or datetime.min
+        return str(r[self.sort_col]).lower()
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col, self.sort_reverse = col, (col == "key_modified")
+        self.rows.sort(key=self._sort_key, reverse=self.sort_reverse)
+        self.apply_filter()
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        f = self.filter_var.get().strip().lower()
+        for r in self.rows:
+            hay = f"{r['name']} {r['publisher']} {r['location']}".lower()
+            if f and f not in hay:
+                continue
+            self.tree.insert("", "end", values=(
+                r["name"], r["version"], r["publisher"], r["install_date"],
+                fmt_dt(r["key_modified"]), r["scope"], r["location"]))
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", "Nothing to export yet. Scan first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["name", "version", "publisher", "install_date", "key_modified",
+                       "scope", "install_location"])
+            for r in self.rows:
+                w.writerow([r["name"], r["version"], r["publisher"], r["install_date"],
+                           fmt_dt(r["key_modified"]), r["scope"], r["location"]])
+        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Hosts Check tab
+# ---------------------------------------------------------------------------
+class HostsCheckTab(ttk.Frame):
+    COLUMNS = ("line", "ip", "host", "kind", "note")
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.rows = []
+        self._build_ui()
+
+    def _build_ui(self):
+        note = ("Reads the Windows hosts file. A stock hosts file has only comments, "
+                "so any active entry beyond localhost is worth a look. Entries that "
+                "point a domain at 0.0.0.0 / 127.0.0.1 block it; entries pointing "
+                "at another IP redirect it. Some cheat clients add entries to stop "
+                "anti-cheat or report domains from loading - but plenty of "
+                "legitimate software (ad blockers, dev tools) edits this file too, "
+                "so check what a flagged entry actually is before reading into it.")
+        ttk.Label(self, text=note, wraplength=1000, foreground="gray").pack(fill="x")
+
+        ctl = ttk.Frame(self)
+        ctl.pack(fill="x", pady=(8, 0))
+        ttk.Button(ctl, text="Check hosts file", command=self.check).pack(side="left")
+        ttk.Button(ctl, text="Export...", command=self.export).pack(side="left", padx=6)
+        ttk.Label(ctl, text=f"File: {HOSTS_PATH}", foreground="gray").pack(side="left", padx=(16, 0))
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=self.COLUMNS, show="headings")
+        widths = {"line": 60, "ip": 140, "host": 320, "kind": 200, "note": 300}
+        labels = {"line": "Line", "ip": "IP", "host": "Hostname", "kind": "Type",
+                  "note": "Note"}
+        for c in self.COLUMNS:
+            self.tree.heading(c, text=labels[c])
+            self.tree.column(c, width=widths[c], anchor="w", stretch=(c == "note"))
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def check(self):
+        result = parse_hosts_file()
+        self.tree.delete(*self.tree.get_children())
+        if result["error"]:
+            self.rows = []
+            self.status.set(f"Couldn't read the hosts file: {result['error']}")
+            return
+        self.rows = result["rows"]
+        for r in self.rows:
+            self.tree.insert("", "end", values=(r["line"], r["ip"], r["host"], r["kind"], r["note"]))
+        extra = [r for r in self.rows if r["kind"] != "default (localhost)"]
+        stamp = f"Last modified {fmt_dt(result['modified'])}, {result['size']} bytes."
+        if extra:
+            self.status.set(f"{len(extra)} active entr{'y' if len(extra)==1 else 'ies'} beyond "
+                            f"localhost. {stamp}")
+        else:
+            self.status.set(f"No active entries beyond localhost - looks clean. {stamp}")
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Export", "Nothing to export yet. Run a check first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV", "*.csv"), ("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["line", "ip", "hostname", "type", "note"])
+            for r in self.rows:
+                w.writerow([r["line"], r["ip"], r["host"], r["kind"], r["note"]])
+        self.status.set(f"Exported {len(self.rows)} rows to {path}")
+
+
+# ---------------------------------------------------------------------------
 # Process Timeline tab
 # ---------------------------------------------------------------------------
 class ProcessTimelineTab(ttk.Frame):
@@ -2465,6 +2767,8 @@ class App(tk.Tk):
         self.servers_tab = ServersTab(nb)
         self.recycle_tab = RecycleBinTab(nb)
         self.prefetch_tab = PrefetchTab(nb)
+        self.programs_tab = InstalledProgramsTab(nb)
+        self.hosts_tab = HostsCheckTab(nb)
         self.timeline_tab = ProcessTimelineTab(nb)
         self.credits_tab = CreditsTab(nb)
 
@@ -2475,6 +2779,8 @@ class App(tk.Tk):
         nb.add(self.servers_tab, text="Servers")
         nb.add(self.recycle_tab, text="Recycle Bin")
         nb.add(self.prefetch_tab, text="Prefetch")
+        nb.add(self.programs_tab, text="Installed Programs")
+        nb.add(self.hosts_tab, text="Hosts Check")
         nb.add(self.timeline_tab, text="Process Timeline")
         nb.add(self.credits_tab, text="Credits")
 

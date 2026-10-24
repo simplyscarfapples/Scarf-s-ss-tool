@@ -1,4 +1,4 @@
-# Scarf's SS Tool
+# Scarf's SS Tool 1.0
 
 A Windows GUI for checking a PC for cheat clients during a screenshare the
 other person has agreed to. Results are leads to review, not proof of cheating.
@@ -22,6 +22,8 @@ Missing dependencies (`psutil`) install automatically on first run.
 - **Servers** — lists saved servers from servers.dat across launchers/profiles
 - **Recycle Bin** — shows deleted-file history
 - **Prefetch** — shows program run history
+- **Installed Programs** — lists installed software from the registry, including leftover entries from uninstalled programs
+- **Hosts Check** — shows active entries in the Windows hosts file that block or redirect domains
 - **Process Timeline** — lists what launched after a chosen process
 - Dark mode
 - Auto-installs missing dependencies
