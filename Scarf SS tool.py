@@ -5,10 +5,12 @@ Tabs:
   - Memory Scan:        scans a running process's memory for keyword strings
   - DLL Scanner:        lists DLLs loaded into a process
   - Log Checker:        usernames seen in logs (possible alts) + launcher accounts
-  - Mods Scanner:       finds mods folders and hashes jars
+  - Mods Scanner:       finds mods folders, inspects jars and game versions
+  - Versions Audit:     version folders vs. official hashes, JVM args, launcher profiles
   - Servers:            saved servers from servers.dat
   - Recycle Bin:        reads $Recycle.Bin metadata for deleted-file history
   - Prefetch:           reads C:\\Windows\\Prefetch (program run history, incl. Win10/11)
+  - Crash Reports:      Minecraft crash reports, JVM hs_err logs, Windows Error Reports
   - Installed Programs: registry uninstall entries, including leftovers
   - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
@@ -87,7 +89,7 @@ import struct
 import threading
 import winreg
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -1219,6 +1221,535 @@ def scan_mods(roots, tiers=None, include_versions=True, stop=None, progress_cb=N
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers for the version / crash-report audits
+# ---------------------------------------------------------------------------
+def _win_norm(path):
+    """Lower-cased, backslash-normalised path for prefix comparisons."""
+    return path.replace("/", "\\").lower()
+
+
+def _win_basename(path):
+    return re.split(r"[\\/]", path.rstrip("\\/"))[-1]
+
+
+def _win_dirname(path):
+    return "\\".join(re.split(r"[\\/]", path.rstrip("\\/"))[:-1])
+
+
+# JVM options that load code from outside the game's own jars. Plenty of legitimate
+# software uses some of these (Lunar's own agent, profilers), so a hit is a lead.
+SUSPICIOUS_JVM_ARGS = ("-javaagent", "-agentlib", "-agentpath", "-Xbootclasspath", "-noverify",
+                       "-Xverify:none", "-Djava.system.class.loader", "--patch-module")
+_SUSPICIOUS_LOWER = tuple(a.lower() for a in SUSPICIOUS_JVM_ARGS)
+
+# Launch lines and crash logs can contain the player's session token. It is never
+# displayed or exported: anything that looks like one is replaced before it is shown.
+_SECRET_ARG_RE = re.compile(
+    r"(--(?:accessToken|session|xuid|clientId|userProperties)(?:=|\s+))\S+", re.I)
+
+
+def redact_secrets(text):
+    return _SECRET_ARG_RE.sub(r"\1<hidden>", text)
+
+
+def find_suspicious_jvm_args(args):
+    """args: iterable of JVM option strings -> the ones worth a look (redacted)."""
+    return [redact_secrets(a)[:200] for a in args if a.lower().startswith(_SUSPICIOUS_LOWER)]
+
+
+def parse_iso_utc(text):
+    """'2024-05-05T12:34:56.000Z' (UTC) -> naive local datetime, or None."""
+    try:
+        return (datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S")
+                .replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _compose_flags(notes, hits):
+    """notes: [(tier, text)], hits: {keyword: tier} -> (flags text, worst tier).
+    Strongest findings come first."""
+    items = list(notes)
+    if hits:
+        items.append((worst_tier(hits), format_flags(hits)))
+    items.sort(key=lambda n: -SEVERITY_RANK[n[0]])
+    severity = items[0][0] if items else ""
+    return " | ".join(text for _tier, text in items), severity
+
+
+def _keyword_hits_in_text(text, matcher):
+    """Keyword hits in free text (crash logs). Returns ({kw: tier}, evidence str).
+    Matching ignores case and spaces/_/- so 'kill aura' also finds KillAura."""
+    hits, lines = {}, {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("java_command"):
+            continue
+        norm = _norm(stripped)
+        for key, (kw, tier) in matcher:
+            if key in norm:
+                hits[kw] = tier
+                lines.setdefault(kw, redact_secrets(stripped)[:160])
+    evidence = [f"{kw}: {lines[kw]}"
+                for kw in sorted(hits, key=lambda k: (-SEVERITY_RANK[hits[k]], k))[:5]]
+    return hits, "; ".join(evidence)
+
+
+# ---------------------------------------------------------------------------
+# Version folder audit (versions\<name>\ plus launcher_profiles.json)
+# ---------------------------------------------------------------------------
+# Main classes used by the stock launcher and the common loaders. Anything else is
+# worth a look (custom clients often ship their own entry point).
+KNOWN_MAIN_CLASS_PREFIXES = ("net.minecraft.", "net.fabricmc.", "org.quiltmc.", "cpw.mods.",
+                             "net.minecraftforge.", "net.neoforged.", "com.mojang.")
+VERSION_JSON_LIMIT = 2 * 1024 * 1024
+
+
+def _flatten_json_args(items):
+    """Version-json 'arguments' lists mix plain strings with {rules, value} objects."""
+    out = []
+    for item in items or []:
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            value = item.get("value")
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, list):
+                out.extend(v for v in value if isinstance(v, str))
+    return out
+
+
+def sha1_of(path, stop=None):
+    """SHA-1 of a file (what Mojang publishes for client jars); None if stopped/unreadable."""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                if stop is not None and stop.is_set():
+                    return None
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _mtime(path):
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime)
+    except OSError:
+        return None
+
+
+def audit_version_folder(folder, launcher, profile, matcher, stop=None):
+    """One row for versions\\<name>\\, or None if the folder isn't a version folder."""
+    name = os.path.basename(folder)
+    json_path = os.path.join(folder, name + ".json")
+    jar_path = os.path.join(folder, name + ".jar")
+    has_json, has_jar = os.path.isfile(json_path), os.path.isfile(jar_path)
+    if not (has_json or has_jar):
+        return None
+
+    notes, evidence = [], []
+    meta = {}
+    if has_json:
+        parsed = _json_loads(_read_file_head(json_path, VERSION_JSON_LIMIT))
+        if isinstance(parsed, dict):
+            meta = parsed
+        else:
+            notes.append(("context", "version json can't be read"))
+    else:
+        notes.append(("context", "no version json"))
+
+    vid = str(meta.get("id") or "")
+    inherits = str(meta.get("inheritsFrom") or "")
+    main = str(meta.get("mainClass") or "")
+    if vid and vid != name:
+        notes.append(("context", f"json id '{vid}' doesn't match the folder name"))
+    if meta and not has_jar and not inherits:
+        notes.append(("context", "no jar and no inheritsFrom"))
+    if main and not main.startswith(KNOWN_MAIN_CLASS_PREFIXES):
+        notes.append(("context", f"unrecognized main class: {main}"))
+
+    arguments = meta.get("arguments")
+    jvm_args = _flatten_json_args(arguments.get("jvm")) if isinstance(arguments, dict) else []
+    for arg in find_suspicious_jvm_args(jvm_args)[:3]:
+        notes.append(("context", f"JVM arg: {arg[:80]}"))
+        evidence.append(f"JVM argument in the version json: {arg}")
+
+    # Compare the jar with the official client hash Mojang records in the json itself.
+    size, integrity = None, "not checkable"
+    if has_jar:
+        size = os.stat(jar_path).st_size
+        downloads = meta.get("downloads")
+        client = downloads.get("client") if isinstance(downloads, dict) else None
+        want_sha1 = client.get("sha1") if isinstance(client, dict) else None
+        want_size = client.get("size") if isinstance(client, dict) else None
+        if isinstance(want_sha1, str) and want_sha1:
+            if isinstance(want_size, int) and want_size != size:
+                integrity = "DIFFERS"
+                notes.append(("high", f"jar is {size:,} bytes, official is {want_size:,}"))
+                evidence.append(f"Official size {want_size:,} bytes; actual {size:,} bytes.")
+            elif size > VERSION_HASH_CAP:
+                integrity = "too large to hash"
+            else:
+                actual = sha1_of(jar_path, stop)
+                if actual is None:
+                    integrity = "not checked"
+                elif actual.lower() == want_sha1.lower():
+                    integrity = "matches official"
+                else:
+                    integrity = "DIFFERS"
+                    notes.append(("high", "jar SHA-1 differs from the official value in its own json"))
+                    evidence.append(f"Expected SHA-1 {want_sha1}; actual {actual}.")
+
+    # Keyword check (same tiers as the Mods Scanner): folder name, json fields, jar contents.
+    extra = [name, vid, inherits, main]
+    if has_jar:
+        info = inspect_jar(jar_path, matcher, extra)
+        hits, kw_evidence = info["hits"], info["evidence"]
+        if info["note"]:
+            notes.append(("context", info["note"]))
+    else:
+        text = _norm("\x00".join(x for x in extra if x))
+        hits = {kw: tier for key, (kw, tier) in matcher if key in text}
+        kw_evidence = "; ".join(f"{k}: {name}" for k in sorted(hits))
+    if kw_evidence:
+        evidence.append("Keyword evidence: " + kw_evidence)
+
+    flags, severity = _compose_flags(notes, hits)
+    return {"kind": "version", "file": name, "launcher": launcher, "profile": profile,
+            "path": folder, "inherits": inherits, "main_class": main, "size": size,
+            "modified": _mtime(jar_path if has_jar else json_path) or datetime.min,
+            "integrity": integrity, "flags": flags, "severity": severity,
+            "evidence": "\n".join(evidence)}
+
+
+def audit_launcher_profiles(path, launcher, matcher):
+    """Rows for each profile in launcher_profiles.json (Java arguments / custom Java)."""
+    data = _json_loads(_read_file_head(path, 4 * 1024 * 1024))
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        return []
+    file_time = _mtime(path) or datetime.min
+    rows = []
+    for key, prof in profiles.items():
+        if not isinstance(prof, dict):
+            continue
+        name = str(prof.get("name") or key)
+        version_id = str(prof.get("lastVersionId") or "")
+        java_args = str(prof.get("javaArgs") or "")
+        java_dir = str(prof.get("javaDir") or "")
+        game_dir = str(prof.get("gameDir") or "")
+        notes, evidence = [], []
+        for arg in find_suspicious_jvm_args(java_args.split())[:3]:
+            notes.append(("context", f"JVM arg: {arg[:80]}"))
+        if java_dir:
+            notes.append(("context", f"custom Java executable: {java_dir[:80]}"))
+        text = _norm("\x00".join(x for x in (name, version_id, java_args, java_dir, game_dir) if x))
+        hits = {kw: tier for key2, (kw, tier) in matcher if key2 in text}
+        if java_args:
+            evidence.append(f"javaArgs: {redact_secrets(java_args)[:400]}")
+        if java_dir:
+            evidence.append(f"javaDir: {java_dir}")
+        if game_dir:
+            evidence.append(f"gameDir: {game_dir}")
+        flags, severity = _compose_flags(notes, hits)
+        rows.append({"kind": "profile", "file": name, "launcher": launcher, "profile": "",
+                     "path": path, "inherits": version_id, "main_class": "", "size": None,
+                     "modified": parse_iso_utc(prof.get("lastUsed")) or file_time,
+                     "integrity": "-", "flags": flags, "severity": severity,
+                     "evidence": "\n".join(evidence)})
+    return rows
+
+
+def scan_versions(roots, tiers=None, stop=None, progress_cb=None):
+    """roots: [(label, path), ...] -> rows, flagged ones first."""
+    matcher = build_keyword_matcher(tiers or {})
+    jobs, seen = [], set()
+    for label, root in roots:
+        for vdir in find_dirs_named(root, "versions"):
+            key = os.path.normcase(os.path.abspath(vdir))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                subfolders = sorted(os.listdir(vdir))
+            except OSError:
+                continue
+            profile = profile_label_for(vdir, root)
+            for sub in subfolders:
+                folder = os.path.join(vdir, sub)
+                if os.path.isdir(folder):
+                    jobs.append(("version", label, profile, folder))
+        profiles_json = os.path.join(root, "launcher_profiles.json")
+        key = os.path.normcase(os.path.abspath(profiles_json))
+        if os.path.isfile(profiles_json) and key not in seen:
+            seen.add(key)
+            jobs.append(("profiles", label, "", profiles_json))
+
+    rows = []
+    total = len(jobs) or 1
+    for i, (kind, label, profile, target) in enumerate(jobs):
+        if stop is not None and stop.is_set():
+            break
+        if kind == "version":
+            row = audit_version_folder(target, label, profile, matcher, stop)
+            if row:
+                rows.append(row)
+        else:
+            rows.extend(audit_launcher_profiles(target, label, matcher))
+        if progress_cb:
+            progress_cb((i + 1) * 100 / total)
+    rows.sort(key=lambda r: (-SEVERITY_RANK[r["severity"]], r["launcher"].lower(),
+                             r["kind"], r["file"].lower()))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Crash report audit (Minecraft crash-reports, JVM hs_err logs, Windows Error Reports)
+# ---------------------------------------------------------------------------
+CRASH_READ_CAP = 8 * 1024 * 1024
+MAX_EVIDENCE_PATHS = 25
+WER_LABEL_PREFIX = "Windows Error Reporting"
+KIND_MC, KIND_HS, KIND_WER = "MC report", "hs_err", "WER"
+
+# DLLs that legitimately live outside the usual folders (game natives, JNA, drivers).
+BENIGN_DLL_PREFIXES = ("lwjgl", "jna", "glfw", "openal", "jemalloc", "freetype", "jinput", "sdl")
+DLL_SUFFIXES = (".dll", ".asi", ".drv", ".ocx", ".ax")
+
+_CRASH_NAME_TIME_RE = re.compile(r"crash-(\d{4})-(\d{2})-(\d{2})_(\d{2})\.(\d{2})\.(\d{2})")
+_HS_LIB_RE = re.compile(r"^0x[0-9a-fA-F]+\s*-\s*0x[0-9a-fA-F]+\s+(\S.*?)\s*$")
+_HS_FRAME_RE = re.compile(r"^#\s+[A-Za-z]\s+\[(.+?)(?:\+0x[0-9a-fA-F]+)?\]")
+
+
+def get_default_crash_roots():
+    """Launcher folders plus the two Windows Error Reporting stores."""
+    roots = list(get_default_client_roots())
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append((WER_LABEL_PREFIX + " (user)", os.path.join(local, "Microsoft", "Windows", "WER")))
+    program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+    roots.append((WER_LABEL_PREFIX + " (system)", os.path.join(program_data, "Microsoft", "Windows", "WER")))
+    return roots
+
+
+def _trusted_dll_prefixes(java_home=""):
+    env = os.environ
+    candidates = (env.get("WINDIR", r"C:\Windows"), env.get("ProgramFiles", r"C:\Program Files"),
+                  env.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), java_home)
+    return tuple(_win_norm(c).rstrip("\\") + "\\" for c in candidates if c)
+
+
+def untrusted_dlls(paths, java_home=""):
+    """DLLs outside Windows / Program Files / the Java install (minus known natives)."""
+    prefixes = _trusted_dll_prefixes(java_home)
+    out = []
+    for p in paths:
+        norm = _win_norm(p)
+        if not norm.endswith(DLL_SUFFIXES):
+            continue
+        if norm.startswith(prefixes) or _win_basename(norm).startswith(BENIGN_DLL_PREFIXES):
+            continue
+        out.append(p)
+    return out
+
+
+def _dll_findings(untrusted, crashed_module=""):
+    """-> (notes, evidence lines) for a list of untrusted DLL paths."""
+    if not untrusted:
+        return [], []
+    names = [_win_basename(p) for p in untrusted]
+    shown = ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
+    notes = [("context", f"{len(names)} DLL(s) outside system/Java folders: {shown}")]
+    evidence = ["DLLs outside Windows / Program Files / Java folders:"]
+    evidence += [f"  {p}" for p in untrusted[:MAX_EVIDENCE_PATHS]]
+    if len(untrusted) > MAX_EVIDENCE_PATHS:
+        evidence.append(f"  ... and {len(untrusted) - MAX_EVIDENCE_PATHS} more")
+    if crashed_module and any(_win_basename(p).lower() == crashed_module.lower() for p in untrusted):
+        notes.insert(0, ("context", f"crashed inside {crashed_module}, which is outside system/Java folders"))
+    return notes, evidence
+
+
+def read_text_capped(path):
+    with open(path, "rb") as f:
+        raw = f.read(CRASH_READ_CAP)
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):          # Report.wer is UTF-16
+        return raw.decode("utf-16", errors="replace")
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def analyze_mc_crash(text, filename):
+    """Minecraft crash-reports\\crash-*.txt -> (summary, jvm flags, time or None)."""
+    lines = text.splitlines()
+    description = exception = ""
+    for i, ln in enumerate(lines):
+        if ln.startswith("Description:"):
+            description = ln.split(":", 1)[1].strip()
+            for nxt in lines[i + 1:i + 8]:
+                s = nxt.strip()
+                if s and not s.startswith("at "):
+                    exception = s
+                    break
+            break
+    jvm_flags = []
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("JVM Flags:"):
+            jvm_flags = s.split(";", 1)[1].split() if ";" in s else []
+            break
+    when = None
+    m = _CRASH_NAME_TIME_RE.search(filename)
+    if m:
+        try:
+            when = datetime(*map(int, m.groups()))
+        except ValueError:
+            when = None
+    summary = description + (f" - {exception[:100]}" if exception else "")
+    return summary, jvm_flags, when
+
+
+def analyze_hs_err(text):
+    """JVM fatal-error log -> (summary, crashing module, jvm args, loaded library paths)."""
+    lines = text.splitlines()
+    summary = problem = ""
+    jvm_args, libs = [], []
+    for i, ln in enumerate(lines):
+        if not summary and "A fatal error has been detected" in ln:
+            for nxt in lines[i + 1:i + 6]:
+                s = nxt.lstrip("#").strip()
+                if s:
+                    summary = re.split(r"\s+at pc=", s)[0][:140]
+                    break
+        elif ln.startswith("# Problematic frame:") and i + 1 < len(lines):
+            m = _HS_FRAME_RE.match(lines[i + 1])
+            if m:
+                problem = m.group(1)
+        elif ln.startswith("jvm_args:"):
+            jvm_args = ln.split(":", 1)[1].split()
+        else:
+            m = _HS_LIB_RE.match(ln)
+            if m:
+                libs.append(m.group(1))
+    return summary, problem, jvm_args, libs
+
+
+def parse_wer(text):
+    """Report.wer -> (key/value dict, loaded module paths, fault module name)."""
+    kv, modules = {}, []
+    for ln in text.splitlines():
+        key, sep, value = ln.partition("=")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key.startswith("LoadedModule["):
+            modules.append(value)
+        else:
+            kv.setdefault(key, value)
+    fault = ""
+    for key, value in kv.items():
+        m = re.match(r"Sig\[(\d+)\]\.Name$", key)
+        if m and value.lower() == "fault module name":
+            fault = kv.get(f"Sig[{m.group(1)}].Value", "")
+            break
+    return kv, modules, fault
+
+
+def audit_crash_file(label, kind, path, matcher):
+    """One row for a crash file, or None if it isn't relevant (non-Java WER report)."""
+    try:
+        text = read_text_capped(path)
+    except OSError as exc:
+        return {"time": _mtime(path) or datetime.min, "kind": kind, "launcher": label,
+                "file": os.path.basename(path), "path": path, "summary": "",
+                "flags": f"couldn't read file: {exc}", "severity": "context", "evidence": ""}
+
+    notes, evidence = [], []
+    when, summary = None, ""
+    if kind == KIND_MC:
+        summary, jvm_flags, when = analyze_mc_crash(text, os.path.basename(path))
+        for arg in find_suspicious_jvm_args(jvm_flags)[:3]:
+            notes.append(("context", f"JVM flag: {arg[:80]}"))
+    elif kind == KIND_HS:
+        summary, problem, jvm_args, libs = analyze_hs_err(text)
+        for arg in find_suspicious_jvm_args(jvm_args)[:3]:
+            notes.append(("context", f"JVM arg: {arg[:80]}"))
+        exe = next((p for p in libs if _win_norm(p).endswith(("\\javaw.exe", "\\java.exe"))), "")
+        java_home = _win_dirname(_win_dirname(exe)) if exe else ""
+        dll_notes, dll_evidence = _dll_findings(untrusted_dlls(libs, java_home), problem)
+        notes += dll_notes
+        evidence += dll_evidence
+    else:
+        kv, modules, fault = parse_wer(text)
+        app = kv.get("AppName", "")
+        if not any(h in (app + " " + kv.get("AppPath", "")).lower() for h in MC_NAME_HINTS):
+            return None
+        try:
+            when = filetime_to_datetime(int(kv.get("EventTime", "0")))
+        except ValueError:
+            when = None
+        summary = f"{app} - {kv.get('FriendlyEventName') or kv.get('EventType', 'crash')}"
+        if fault:
+            summary += f", fault module {fault}"
+        exe = kv.get("AppPath", "")
+        java_home = _win_dirname(_win_dirname(exe)) if exe else ""
+        dll_notes, dll_evidence = _dll_findings(untrusted_dlls(modules, java_home), fault)
+        notes += dll_notes
+        evidence += dll_evidence
+
+    hits, kw_evidence = _keyword_hits_in_text(text, matcher)
+    if kw_evidence:
+        evidence.insert(0, "Keyword evidence: " + kw_evidence)
+    flags, severity = _compose_flags(notes, hits)
+    return {"time": when or _mtime(path) or datetime.min, "kind": kind, "launcher": label,
+            "file": os.path.basename(path), "path": path, "summary": summary[:200],
+            "flags": flags, "severity": severity, "evidence": "\n".join(evidence)}
+
+
+def scan_crash_reports(roots, tiers=None, stop=None, progress_cb=None):
+    """roots: [(label, path), ...] -> rows, flagged ones first, newest first."""
+    matcher = build_keyword_matcher(tiers or {})
+    files, seen = [], set()
+
+    def add(label, kind, path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            files.append((label, kind, path))
+
+    walk_prune = HEAVY_DIRS - {"crash-reports"}
+    for label, root in roots:
+        if label.startswith(WER_LABEL_PREFIX):
+            for dirpath, _dn, filenames in _walk_with_depth_limit(root, 4):
+                for fn in filenames:
+                    if fn.lower() == "report.wer":
+                        add(label, KIND_WER, os.path.join(dirpath, fn))
+            continue
+        for dirpath, _dn, filenames in _walk_with_depth_limit(root, 6, walk_prune):
+            in_crash_dir = os.path.basename(dirpath).lower() == "crash-reports"
+            for fn in filenames:
+                low = fn.lower()
+                if in_crash_dir and low.endswith((".txt", ".log")):
+                    add(label, KIND_MC, os.path.join(dirpath, fn))
+                elif low.startswith("hs_err_pid") and low.endswith(".log"):
+                    add(label, KIND_HS, os.path.join(dirpath, fn))
+
+    rows = []
+    total = len(files) or 1
+    for i, (label, kind, path) in enumerate(files):
+        if stop is not None and stop.is_set():
+            break
+        row = audit_crash_file(label, kind, path, matcher)
+        if row:
+            rows.append(row)
+        if progress_cb:
+            progress_cb((i + 1) * 100 / total)
+    rows.sort(key=lambda r: (-SEVERITY_RANK[r["severity"]], -r["time"].timestamp()
+                             if r["time"] > datetime.min else 0))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Recent servers (servers.dat, NBT format)
 # ---------------------------------------------------------------------------
 class NBTReader:
@@ -1774,6 +2305,8 @@ class TableTab(ttk.Frame):
         build_controls(ctl)     extra buttons in the control bar
         row_values(row)         tuple of cell values for the table
         export_row(row)         list of CSV cells for one row
+        detail_text(row)        text for the details box (with HAS_DETAIL = True)
+        row_tags(row)           ('high',) / ('context',) colours a row red / amber
         init_state() / after_build()   run before / after the UI is built
     """
 
@@ -1794,6 +2327,8 @@ class TableTab(ttk.Frame):
     TABLE_EXPAND = True
     NOTE_WRAP = 1000
     SELECT_MODE = "extended"
+    HAS_DETAIL = False        # True -> a read-only box under the table shows detail_text(row)
+    DETAIL_HEIGHT = 5
 
     def __init__(self, parent):
         super().__init__(parent, padding=self.PADDING)
@@ -1855,7 +2390,26 @@ class TableTab(ttk.Frame):
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(8, 0))
 
     def build_after_table(self):
-        pass
+        if self.HAS_DETAIL:
+            self.tree.bind("<<TreeviewSelect>>", self.show_detail)
+            self.detail = tk.Text(self, height=self.DETAIL_HEIGHT, wrap="word", state="disabled")
+            self.detail.pack(fill="x", pady=(8, 0))
+
+    def detail_text(self, row):
+        return ""
+
+    def show_detail(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        visible = self.visible_rows()
+        idx = self.tree.index(sel[0])
+        if idx >= len(visible):
+            return
+        self.detail.config(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("1.0", self.detail_text(visible[idx]))
+        self.detail.config(state="disabled")
 
     def add_filter_box(self, ctl):
         ttk.Label(ctl, text="Filter:").pack(side="left", padx=(20, 2))
@@ -2563,6 +3117,174 @@ class ModsScannerTab(ScanTab):
 
 
 # ---------------------------------------------------------------------------
+# Versions Audit tab (installed game versions + launcher profiles)
+# ---------------------------------------------------------------------------
+def shared_keyword_tiers(widget):
+    """The Memory Scan tab's (possibly edited) keyword box, so there is one list to
+    maintain; falls back to the defaults."""
+    tiers = parse_keyword_lines(DEFAULT_KEYWORDS)
+    mem = getattr(widget.winfo_toplevel(), "tabs", {}).get("Memory Scan")
+    if mem is not None:
+        tiers = mem.get_keywords() or tiers
+    return tiers
+
+
+class VersionsAuditTab(ScanTab):
+    NOTE = ("Audits every installed game version (versions\\<name>\\) and every launcher profile. "
+            "For vanilla versions the jar is compared with the official SHA-1 that Mojang records "
+            "in the version's own json - a modified jar shows as DIFFERS (red). Amber flags are "
+            "oddities worth a look: json id not matching the folder, a missing jar, an unfamiliar "
+            "main class, or JVM options such as -javaagent / -Xbootclasspath in a version json or "
+            "profile (some legitimate tools use these). Keywords come from the Memory Scan list. "
+            "The official hash lives in a file the user could also edit, so treat it as a lead.")
+    COLUMNS = (("flags", "Flags", 270), ("file", "Version / profile", 150), ("kind", "Kind", 55),
+               ("integrity", "Official hash", 110), ("launcher", "Launcher", 90),
+               ("inherits", "Inherits / uses", 90), ("main_class", "Main class", 190),
+               ("size", "Jar size", 75), ("modified", "Modified / last used", 125))
+    STRETCH = "flags"
+    SEARCH_KEYS = ("flags", "file", "kind", "integrity", "launcher", "profile", "inherits", "main_class")
+    EXPORT_HEADER = ["flags", "kind", "official_hash", "launcher", "profile", "name", "inherits_or_uses",
+                     "main_class", "jar_size_bytes", "modified_or_last_used", "details", "full_path"]
+    SCAN_LABEL = "Scan versions"
+    BUSY_TEXT = "Auditing version folders and launcher profiles..."
+    ERROR_TITLE = "Versions audit failed"
+    HAS_PROGRESS = True
+    SORTABLE = True
+    HAS_DETAIL = True
+
+    def init_state(self):
+        super().init_state()
+        self.keyword_count = 0
+
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, "Search locations", defaults=get_default_client_roots(),
+            default_caption="Default launcher folders (unchecked ones weren't found):",
+            custom_caption="Custom launcher/instance folder (or a versions folder itself):")
+
+    def prepare_scan(self):
+        roots = self.picker.selected()
+        if not roots:
+            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
+            return None
+        return (roots, shared_keyword_tiers(self))
+
+    def scan(self, roots, tiers):
+        self.keyword_count = len(tiers)
+        return scan_versions(roots, tiers, self.stop_event, self.report_progress)
+
+    def done_message(self, rows):
+        high = sum(1 for r in rows if r["severity"] == "high")
+        ctx = sum(1 for r in rows if r["severity"] == "context")
+        versions = sum(1 for r in rows if r["kind"] == "version")
+        return (f"Checked {versions} version folder(s) and {len(rows) - versions} launcher profile(s); "
+                f"{high} red, {ctx} amber ({self.keyword_count} keywords checked).")
+
+    def row_values(self, r):
+        return (r["flags"], r["file"], r["kind"], r["integrity"], r["launcher"], r["inherits"],
+                r["main_class"], "-" if r["size"] is None else r["size"], fmt_dt(r["modified"]))
+
+    def row_tags(self, r):
+        return (r["severity"],) if r["severity"] else ()
+
+    def export_row(self, r):
+        return [r["flags"], r["kind"], r["integrity"], r["launcher"], r["profile"], r["file"],
+                r["inherits"], r["main_class"], "" if r["size"] is None else r["size"],
+                fmt_dt(r["modified"]), r["evidence"], r["path"]]
+
+    def sort_key(self, r, col):
+        if col == "flags":
+            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
+        if col == "size":
+            return -1 if r["size"] is None else r["size"]
+        if col == "modified":
+            return r["modified"]
+        return str(r.get(col, "")).lower()
+
+    def sort_starts_descending(self, col):
+        return col in ("flags", "size", "modified")
+
+    def detail_text(self, r):
+        return (f"{r['path']}\nFlags: {r['flags'] or 'none'}\nOfficial hash: {r['integrity']}\n"
+                f"{r['evidence'] or 'No further details.'}")
+
+
+# ---------------------------------------------------------------------------
+# Crash Reports tab (Minecraft crash reports, JVM hs_err logs, Windows Error Reports)
+# ---------------------------------------------------------------------------
+class CrashReportsTab(ScanTab):
+    NOTE = ("Reads crash evidence already on disk: Minecraft's crash-reports folder, JVM fatal-error "
+            "logs (hs_err_pid*.log) and Windows Error Reporting entries for java. A crash often "
+            "names code that was injected into the game: the keyword list (from Memory Scan) is "
+            "checked against the whole report, DLLs loaded from outside Windows / Program Files / "
+            "the Java folder are listed (overlays and recorders show up here too), and suspicious "
+            "JVM options are flagged. Session tokens in these files are never displayed or exported. "
+            "The system-wide Windows Error Reporting folder needs admin rights to read.")
+    COLUMNS = (("flags", "Flags", 300), ("time", "Time", 125), ("kind", "Type", 70),
+               ("launcher", "Source", 115), ("file", "File", 210), ("summary", "Summary", 290))
+    STRETCH = "summary"
+    SEARCH_KEYS = ("flags", "file", "kind", "launcher", "summary")
+    EXPORT_HEADER = ["flags", "time", "type", "source", "file", "summary", "details", "full_path"]
+    SCAN_LABEL = "Scan crash reports"
+    BUSY_TEXT = "Reading crash reports..."
+    ERROR_TITLE = "Crash report scan failed"
+    HAS_PROGRESS = True
+    SORTABLE = True
+    HAS_DETAIL = True
+
+    def init_state(self):
+        super().init_state()
+        self.keyword_count = 0
+
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, "Search locations", defaults=get_default_crash_roots(),
+            default_caption="Default locations (unchecked ones weren't found):",
+            custom_caption="Custom launcher/instance folder (searched for crash-reports and hs_err files):")
+
+    def prepare_scan(self):
+        roots = self.picker.selected()
+        if not roots:
+            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
+            return None
+        return (roots, shared_keyword_tiers(self))
+
+    def scan(self, roots, tiers):
+        self.keyword_count = len(tiers)
+        return scan_crash_reports(roots, tiers, self.stop_event, self.report_progress)
+
+    def done_message(self, rows):
+        high = sum(1 for r in rows if r["severity"] == "high")
+        ctx = sum(1 for r in rows if r["severity"] == "context")
+        return (f"Found {plural(len(rows), 'crash report', 'crash reports')}; {high} red, {ctx} amber "
+                f"({self.keyword_count} keywords checked).")
+
+    def row_values(self, r):
+        return (r["flags"], fmt_dt(r["time"]), r["kind"], r["launcher"], r["file"], r["summary"])
+
+    def row_tags(self, r):
+        return (r["severity"],) if r["severity"] else ()
+
+    def export_row(self, r):
+        return [r["flags"], fmt_dt(r["time"]), r["kind"], r["launcher"], r["file"], r["summary"],
+                r["evidence"], r["path"]]
+
+    def sort_key(self, r, col):
+        if col == "flags":
+            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
+        if col == "time":
+            return r["time"]
+        return str(r.get(col, "")).lower()
+
+    def sort_starts_descending(self, col):
+        return col in ("flags", "time")
+
+    def detail_text(self, r):
+        return (f"{r['path']}\nFlags: {r['flags'] or 'none'}\nSummary: {r['summary'] or '-'}\n"
+                f"{r['evidence'] or 'No further details.'}")
+
+
+# ---------------------------------------------------------------------------
 # Servers tab (recent/saved servers across launchers and profiles)
 # ---------------------------------------------------------------------------
 class ServersTab(ScanTab):
@@ -3084,9 +3806,11 @@ TABS = [
     ("DLL Scanner", DLLScannerTab),
     ("Log Checker", LogCheckerTab),
     ("Mods Scanner", ModsScannerTab),
+    ("Versions Audit", VersionsAuditTab),
     ("Servers", ServersTab),
     ("Recycle Bin", RecycleBinTab),
     ("Prefetch", PrefetchTab),
+    ("Crash Reports", CrashReportsTab),
     ("Installed Programs", InstalledProgramsTab),
     ("Hosts Check", HostsCheckTab),
     ("Process Timeline", ProcessTimelineTab),
