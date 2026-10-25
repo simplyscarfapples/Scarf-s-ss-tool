@@ -67,7 +67,7 @@ APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
 # ---------------------------------------------------------------------------
-REQUIRED = {"psutil": "psutil", "sv_ttk": "sv-ttk"}  # import name -> pip package name
+REQUIRED = {"psutil": "psutil"}  # import name -> pip package name
 
 
 def ensure_dependencies():
@@ -104,11 +104,6 @@ try:
     import psutil
 except ImportError:
     psutil = None
-
-try:
-    import sv_ttk          # Sun Valley theme: Windows 11 look for plain ttk widgets
-except ImportError:
-    sv_ttk = None          # falls back to the built-in "clam" theme
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -2577,6 +2572,39 @@ class ScanTab(TableTab):
     def init_state(self):
         self.worker = None
         self.stop_event = threading.Event()
+        # Worker threads never touch Tk directly: they queue callables here and the
+        # UI thread runs them (see _drain_ui). Calling after() from another thread can
+        # raise "main thread is not in main loop" and leave the Scan button disabled.
+        self._ui_q = queue.SimpleQueue()
+        self._progress_pct = None
+        self.after(100, self._drain_ui)
+
+    def _post(self, fn):
+        """Run fn on the UI thread (immediately, if we're already on it)."""
+        if self.THREADED:
+            self._ui_q.put(fn)
+        else:
+            fn()
+
+    def _drain_ui(self):
+        try:
+            while True:
+                try:
+                    fn = self._ui_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except tk.TclError:
+                    pass                      # widget already destroyed
+                except Exception as exc:      # keep draining; never strand the Scan button
+                    self.set_status(f"Internal error: {exc}")
+            pct, self._progress_pct = self._progress_pct, None
+            if pct is not None and self.HAS_PROGRESS:
+                self.progress.configure(value=pct)
+        except tk.TclError:
+            return                            # tab destroyed - stop polling
+        self.after(100, self._drain_ui)
 
     # ---- hooks ------------------------------------------------------------
     def prepare_scan(self):
@@ -2607,8 +2635,8 @@ class ScanTab(TableTab):
             self.progress.pack(side="right")
 
     def report_progress(self, pct):
-        """Safe to call from the worker thread."""
-        self.after(0, lambda: self.progress.configure(value=pct))
+        """Safe to call from the worker thread (the UI thread applies the latest value)."""
+        self._progress_pct = pct
 
     # ---- running a scan ---------------------------------------------------
     def start_scan(self):
@@ -2622,28 +2650,41 @@ class ScanTab(TableTab):
             self.progress["value"] = 0
         self.scan_btn.config(state="disabled")
         self.set_status(self.BUSY_TEXT)
-        if self.THREADED:
-            self.worker = threading.Thread(target=self._run, args=args, daemon=True)
-            self.worker.start()
-        else:
-            self._run(*args)
+        try:
+            if self.THREADED:
+                self.worker = threading.Thread(target=self._run, args=args, daemon=True)
+                self.worker.start()
+            else:
+                self._run(*args)
+        except Exception as exc:              # e.g. the thread couldn't be started
+            self.scan_btn.config(state="normal")
+            self.set_status(f"Could not start the scan: {exc}")
 
     def _run(self, *args):
+        rows, error = [], None
         try:
             rows = self.scan(*args)
-        except Exception as exc:
-            rows, msg = [], str(exc)
-            self.after(0, lambda: messagebox.showerror(self.ERROR_TITLE, msg))
-        if self.THREADED:
-            self.after(0, lambda: self._finish(rows))
-        else:
-            self._finish(rows)
+        except BaseException as exc:          # whatever happens, _finish must still run
+            error = str(exc) or exc.__class__.__name__
+        finally:
+            self._post(lambda: self._finish(rows, error))
 
-    def _finish(self, rows):
-        self.on_scan_done(rows)
-        self.set_rows(rows)
-        self.scan_btn.config(state="normal")
-        self.set_status(self.done_message(rows))
+    def _finish(self, rows, error=None):
+        """Always runs on the UI thread and always re-enables the Scan button."""
+        problem = error
+        try:
+            if error is None:
+                self.on_scan_done(rows)
+                self.set_rows(rows)
+        except Exception as exc:              # a bad row / widget error in post-processing
+            problem = f"{exc.__class__.__name__}: {exc}"
+        finally:
+            self.scan_btn.config(state="normal")
+        if problem is not None:
+            self.set_status(f"{self.ERROR_TITLE}: {problem}")
+            messagebox.showerror(self.ERROR_TITLE, problem)
+        else:
+            self.set_status(self.done_message(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -3815,16 +3856,10 @@ class CreditsTab(ttk.Frame):
 # ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
-# Palettes follow the Sun Valley (Windows 11) theme so classic tk widgets
-# (Text / Listbox / Canvas / sidebar) match the ttk ones.
-LIGHT_COLORS = dict(bg="#fafafa", fg="#1a1a1a", field_bg="#ffffff", select="#005fb8",
-                    select_fg="#ffffff", high="#c62828", context="#a15c00",
-                    border="#d0d0d0", accent="#005fb8", hover="#f0f0f0",
-                    active="#e4e4e4", muted="#707070")
-DARK_COLORS = dict(bg="#1c1c1c", fg="#f2f2f2", field_bg="#2b2b2b", select="#57c8ff",
-                   select_fg="#000000", high="#ff6b6b", context="#e0a030",
-                   border="#404040", accent="#57c8ff", hover="#282828",
-                   active="#363636", muted="#a0a0a0")
+LIGHT_COLORS = dict(bg="#f0f0f0", fg="#000000", field_bg="#ffffff", select="#3399ff",
+                    select_fg="#ffffff", high="#c62828", context="#a15c00")
+DARK_COLORS = dict(bg="#1e1e1e", fg="#e6e6e6", field_bg="#2b2b2b", select="#3a6ea5",
+                   select_fg="#ffffff", high="#ff6b6b", context="#e0a030")
 
 # (tab title, tab class) in display order - add a new tab by adding a line here.
 TABS = [
@@ -3842,72 +3877,42 @@ TABS = [
     ("Process Timeline", ProcessTimelineTab),
     ("Credits", CreditsTab),
 ]
-PINNED_BOTTOM = {"Credits"}      # these sidebar entries sit at the bottom
-
-
-class SidebarItem(tk.Frame):
-    """One clickable sidebar entry: accent bar + label, with hover/selected states."""
-
-    def __init__(self, parent, text, command):
-        super().__init__(parent, cursor="hand2")
-        self.selected = False
-        self.hovered = False
-        self.colors = LIGHT_COLORS
-        self.bar = tk.Frame(self, width=3)
-        self.bar.pack(side="left", fill="y", pady=6)
-        self.label = tk.Label(self, text=text, anchor="w", font=("Segoe UI", 10),
-                              padx=12, pady=7)
-        self.label.pack(side="left", fill="x", expand=True)
-        for w in (self, self.bar, self.label):
-            w.bind("<Button-1>", lambda e: command())
-            w.bind("<Enter>", lambda e: self._set_hover())
-            w.bind("<Leave>", lambda e: self.after_idle(self._set_hover))
-
-    def _set_hover(self):
-        try:
-            under = self.winfo_containing(*self.winfo_pointerxy())
-        except (KeyError, tk.TclError):
-            return
-        hovered = under is not None and (under is self or str(under).startswith(str(self) + "."))
-        if hovered != self.hovered:
-            self.hovered = hovered
-            self.apply(self.colors)
-
-    def set_selected(self, selected):
-        self.selected = selected
-        self.apply(self.colors)
-
-    def apply(self, c):
-        self.colors = c
-        bg = c["active"] if self.selected else (c["hover"] if self.hovered else c["bg"])
-        self.configure(bg=bg)
-        self.label.configure(bg=bg, fg=c["fg"])
-        self.bar.configure(bg=c["accent"] if self.selected else bg)
-
-
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {VERSION_LABEL}")
-        self.geometry("1200x780")
-        self.minsize(1000, 640)
+        self.geometry("1150x750")
+        self.minsize(950, 600)
 
         self.style = ttk.Style(self)
+        # Always use "clam" (not the native "vista" theme) for BOTH light and dark mode.
+        # "vista" is natively drawn and only partially respects color overrides, which
+        # is what caused light mode text/background to look broken after a theme switch.
+        # "clam" honors every color we set, so both modes render consistently.
         self.dark_mode = tk.BooleanVar(value=False)
         self.colors = LIGHT_COLORS
-        self.current = None
-        self.items = {}      # title -> SidebarItem
-        self.tabs = {}       # title -> tab widget
 
-        self._build_sidebar()
-        ttk.Separator(self, orient="vertical").pack(side="left", fill="y")
-        self._build_main()
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        banner = ttk.Label(
+            top,
+            text=(f"{APP_NAME} {VERSION_LABEL} - for use during a screenshare the other "
+                  "person has agreed to. Results are leads to review, not proof of cheating."),
+            anchor="w", padding=4, foreground="#888")
+        banner.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(top, text="Dark mode", variable=self.dark_mode,
+                        command=self.toggle_dark_mode).pack(side="right", padx=8)
 
-        self.show_tab(TABS[0][0])
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+        nb.enable_traversal()        # Ctrl+Tab / Ctrl+PageUp / Ctrl+PageDown switch tabs
+        self.tabs = {}
+        for title, tab_class in TABS:
+            tab = tab_class(nb)
+            nb.add(tab, text=title)
+            self.tabs[title] = tab
+
         self._apply_theme(LIGHT_COLORS)
-
-        self.bind("<Control-Next>", lambda e: self._step_tab(1))
-        self.bind("<Control-Prior>", lambda e: self._step_tab(-1))
 
         if psutil is None:
             messagebox.showwarning(
@@ -3916,112 +3921,17 @@ class App(tk.Tk):
                 "Recycle Bin tabs still work; Process Timeline needs psutil - "
                 "install manually with: pip install psutil")
 
-    # ---- layout -----------------------------------------------------------
-    def _build_sidebar(self):
-        side = ttk.Frame(self, width=220)
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-
-        ttk.Label(side, text="Scarf's SS Tool", font=("Segoe UI Semibold", 14)
-                  ).pack(anchor="w", padx=16, pady=(18, 0))
-        ttk.Label(side, text=f"Screenshare helper  -  v{VERSION_LABEL}", foreground="gray"
-                  ).pack(anchor="w", padx=16, pady=(0, 14))
-
-        # Bottom first (pack stacks bottom-up): dark-mode switch, then pinned tabs.
-        switch_style = "Switch.TCheckbutton" if sv_ttk else "TCheckbutton"
-        ttk.Checkbutton(side, text="Dark mode", style=switch_style,
-                        variable=self.dark_mode, command=self.toggle_dark_mode
-                        ).pack(side="bottom", anchor="w", padx=16, pady=(8, 16))
-        for title, _ in reversed(TABS):
-            if title in PINNED_BOTTOM:
-                self._add_item(side, title, "bottom")
-        for title, _ in TABS:
-            if title not in PINNED_BOTTOM:
-                self._add_item(side, title, "top")
-
-    def _add_item(self, parent, title, where):
-        item = SidebarItem(parent, title, lambda t=title: self.show_tab(t))
-        item.pack(side=where, fill="x", padx=(8, 8), pady=1)
-        self.items[title] = item
-
-    def _build_main(self):
-        main = ttk.Frame(self)
-        main.pack(side="left", fill="both", expand=True)
-
-        self.page_title = tk.StringVar()
-        ttk.Label(main, textvariable=self.page_title, font=("Segoe UI Semibold", 18)
-                  ).pack(anchor="w", padx=20, pady=(16, 4))
-
-        footer = ttk.Label(
-            main,
-            text=("For use during a screenshare the other person has agreed to. "
-                  "Results are leads to review, not proof of cheating."),
-            foreground="gray", anchor="w", justify="left")
-        footer.pack(side="bottom", fill="x", padx=20, pady=(4, 10))
-        footer.bind("<Configure>", lambda e: footer.configure(wraplength=max(200, e.width)))
-
-        content = ttk.Frame(main)
-        content.pack(fill="both", expand=True, padx=8)
-        content.grid_rowconfigure(0, weight=1)
-        content.grid_columnconfigure(0, weight=1)
-        for title, tab_class in TABS:
-            tab = tab_class(content)
-            tab.grid(row=0, column=0, sticky="nsew")
-            tab.grid_remove()                      # only the selected page is mapped
-            self.tabs[title] = tab
-
-    # ---- navigation -------------------------------------------------------
-    def show_tab(self, title):
-        if title == self.current:
-            return
-        if self.current:
-            self.tabs[self.current].grid_remove()
-            self.items[self.current].set_selected(False)
-        self.tabs[title].grid()
-        self.items[title].set_selected(True)
-        self.page_title.set(title)
-        self.current = title
-
-    def _step_tab(self, delta):
-        titles = [t for t, _ in TABS]
-        self.show_tab(titles[(titles.index(self.current) + delta) % len(titles)])
-
     # ---- theming ----------------------------------------------------------
     def toggle_dark_mode(self):
         self._apply_theme(DARK_COLORS if self.dark_mode.get() else LIGHT_COLORS)
 
     def _apply_theme(self, c):
         self.colors = c
-        dark = c is DARK_COLORS
-        if sv_ttk:
-            sv_ttk.set_theme("dark" if dark else "light")
-        else:
-            self._apply_fallback_theme(c)
-        self.configure(bg=c["bg"])
-        self._recolor_classic_widgets(self, c)
-        for item in self.items.values():
-            item.apply(c)
-        self._set_titlebar_dark(dark)
-
-    def _set_titlebar_dark(self, dark):
-        """Match the Windows title bar to the theme (Win10 1809+ / Win11)."""
-        try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            value = ctypes.c_int(1 if dark else 0)
-            for attr in (20, 19):       # DWMWA_USE_IMMERSIVE_DARK_MODE (new / old id)
-                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
-                    break
-        except Exception:
-            pass
-
-    def _apply_fallback_theme(self, c):
-        """Used only when sv-ttk could not be installed: plain 'clam' with our colors."""
         s = self.style
         s.theme_use("clam")
         s.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field_bg"])
-        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label", "TCheckbutton"):
+        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
+                     "TCheckbutton", "TNotebook"):
             s.configure(name, background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("TButton", background=c["field_bg"], foreground=c["fg"])
@@ -4032,12 +3942,17 @@ class App(tk.Tk):
                     background=c["field_bg"])
         s.map("TCombobox", fieldbackground=[("readonly", c["field_bg"])],
               foreground=[("readonly", c["fg"])])
+        s.configure("TNotebook.Tab", background=c["field_bg"], foreground=c["fg"])
+        s.map("TNotebook.Tab", background=[("selected", c["select"])],
+              foreground=[("selected", c["select_fg"])])
         s.configure("Treeview", background=c["field_bg"], fieldbackground=c["field_bg"],
                     foreground=c["fg"])
         s.configure("Treeview.Heading", background=c["bg"], foreground=c["fg"])
         s.map("Treeview", background=[("selected", c["select"])],
               foreground=[("selected", c["select_fg"])])
         s.configure("Horizontal.TProgressbar", background=c["select"])
+        self.configure(bg=c["bg"])
+        self._recolor_classic_widgets(self, c)
 
     def _recolor_classic_widgets(self, widget, c):
         """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas), so walk the
@@ -4045,9 +3960,7 @@ class App(tk.Tk):
         for child in widget.winfo_children():
             try:
                 if isinstance(child, (tk.Text, tk.Listbox)):
-                    opts = dict(bg=c["field_bg"], fg=c["fg"], relief="flat", borderwidth=0,
-                                highlightthickness=1, highlightbackground=c["border"],
-                                highlightcolor=c["accent"],
+                    opts = dict(bg=c["field_bg"], fg=c["fg"], highlightthickness=0,
                                 selectbackground=c["select"], selectforeground=c["select_fg"])
                     if isinstance(child, tk.Text):       # Listbox has no insertbackground option
                         opts["insertbackground"] = c["fg"]
