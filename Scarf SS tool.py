@@ -32,12 +32,29 @@ import sys
 if sys.platform != "win32":
     sys.exit("This tool only works on Windows.")
 
+import csv
+import ctypes
+import ctypes.wintypes as wt
+import gzip
+import hashlib
+import importlib
+import json
+import os
+import queue
+import re
+import string
+import struct
+import subprocess
+import threading
+import winreg
+import zipfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
 # ---------------------------------------------------------------------------
-import importlib
-import subprocess
-
 REQUIRED = {"psutil": "psutil"}  # import name -> pip package name
 
 
@@ -53,8 +70,7 @@ def ensure_dependencies():
     print(f"[*] Installing missing dependencies: {', '.join(missing)}")
     try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *missing]
-        )
+            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *missing])
         importlib.invalidate_caches()
     except Exception as exc:
         print(f"[!] Auto-install failed ({exc}). "
@@ -74,22 +90,6 @@ try:
     import psutil
 except ImportError:
     psutil = None
-
-import csv
-import ctypes
-import ctypes.wintypes as wt
-import gzip
-import hashlib
-import json
-import os
-import queue
-import re
-import string
-import struct
-import threading
-import winreg
-import zipfile
-from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -115,6 +115,7 @@ CONTEXT_KEYWORDS = [
 DEFAULT_KEYWORDS = HIGH_KEYWORDS + [CONTEXT_PREFIX + k for k in CONTEXT_KEYWORDS]
 
 SEVERITY_RANK = {"": 0, "context": 1, "high": 2}
+MC_NAME_HINTS = ("javaw", "java", "minecraft", "lunarclient", "lunar", "badlion")
 
 
 def parse_keyword_lines(lines):
@@ -140,10 +141,8 @@ def keyword_lines(tiers):
     return high + ctx
 
 
-MC_NAME_HINTS = ("javaw", "java", "minecraft", "lunarclient", "lunar", "badlion")
-
 # ---------------------------------------------------------------------------
-# WinAPI (used by the memory scan tab)
+# WinAPI
 # ---------------------------------------------------------------------------
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -152,6 +151,9 @@ PROCESS_VM_READ = 0x0010
 MEM_COMMIT = 0x1000
 PAGE_NOACCESS = 0x01
 PAGE_GUARD = 0x100
+TH32CS_SNAPMODULE = 0x00000008
+TH32CS_SNAPMODULE32 = 0x00000010
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
@@ -165,25 +167,6 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         ("Protect", wt.DWORD),
         ("Type", wt.DWORD),
     ]
-
-
-kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
-kernel32.OpenProcess.restype = wt.HANDLE
-kernel32.VirtualQueryEx.argtypes = [
-    wt.HANDLE, ctypes.c_void_p,
-    ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
-]
-kernel32.VirtualQueryEx.restype = ctypes.c_size_t
-kernel32.ReadProcessMemory.argtypes = [
-    wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
-]
-kernel32.ReadProcessMemory.restype = wt.BOOL
-kernel32.CloseHandle.argtypes = [wt.HANDLE]
-
-# --- Toolhelp32 bindings, used by the DLL / loaded-module scanner ----------
-TH32CS_SNAPMODULE = 0x00000008
-TH32CS_SNAPMODULE32 = 0x00000010
 
 
 class MODULEENTRY32W(ctypes.Structure):
@@ -201,6 +184,19 @@ class MODULEENTRY32W(ctypes.Structure):
     ]
 
 
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.VirtualQueryEx.argtypes = [
+    wt.HANDLE, ctypes.c_void_p,
+    ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
+]
+kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+kernel32.ReadProcessMemory.argtypes = [
+    wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+]
+kernel32.ReadProcessMemory.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
 kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
 kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
 kernel32.Module32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
@@ -217,25 +213,68 @@ def is_admin():
 
 
 def relaunch_as_admin():
-    params = " ".join(f'"{a}"' for a in sys.argv)
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    """Ask Windows to restart this script elevated. Returns False if the user
+    declined the UAC prompt (ShellExecute returns <= 32 on failure)."""
+    args = [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    params = " ".join(f'"{a}"' for a in args)
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1) > 32
 
 
 def filetime_to_datetime(ft):
     """Convert a Windows FILETIME (100ns ticks since 1601-01-01, UTC) to a local datetime."""
     if not ft:
         return None
-    EPOCH_AS_FILETIME = 116444736000000000
-    HUNDREDS_OF_NS = 10_000_000
     try:
-        # fromtimestamp() gives local time, matching every other timestamp in the tool
-        return datetime.fromtimestamp((ft - EPOCH_AS_FILETIME) / HUNDREDS_OF_NS)
+        return datetime.fromtimestamp((ft - 116444736000000000) / 10_000_000)
     except (OverflowError, OSError, ValueError):
         return None
 
 
 def fmt_dt(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "-"
+
+
+# ---------------------------------------------------------------------------
+# Windows path helpers
+# ---------------------------------------------------------------------------
+def _win_norm(path):
+    """Lower-cased, backslash-normalised path for prefix comparisons."""
+    return path.replace("/", "\\").lower()
+
+
+def _win_basename(path):
+    return re.split(r"[\\/]", path.rstrip("\\/"))[-1]
+
+
+def _win_dirname(path):
+    return "\\".join(re.split(r"[\\/]", path.rstrip("\\/"))[:-1])
+
+
+def is_under(path, folder):
+    """True if path is inside folder (so C:\\Windows2 is NOT under C:\\Windows)."""
+    return bool(folder) and _win_norm(path).startswith(_win_norm(folder).rstrip("\\") + "\\")
+
+
+def _mtime(path):
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime)
+    except OSError:
+        return None
+
+
+def _read_file_head(path, limit=256 * 1024):
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit)
+    except OSError:
+        return b""
+
+
+def _json_loads(raw):
+    try:
+        return json.loads(raw.decode("utf-8-sig", errors="ignore"), strict=False)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +290,8 @@ def list_processes(name_filter):
             if name_filter in n.lower():
                 results.append((p.info["pid"], n))
     else:
-        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True,
-                             creationflags=0x08000000).stdout
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
         for row in csv.reader(out.splitlines()):
             if len(row) >= 2 and name_filter in row[0].lower():
                 try:
@@ -264,6 +302,7 @@ def list_processes(name_filter):
 
 
 def iter_regions(handle):
+    """Yield (base, size) for every committed, readable memory region."""
     mbi = MEMORY_BASIC_INFORMATION()
     address = 0
     max_addr = 0x7FFFFFFFFFFF if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x7FFFFFFF
@@ -274,6 +313,8 @@ def iter_regions(handle):
             break
         base = mbi.BaseAddress or 0
         size = mbi.RegionSize
+        if not size:                      # guard against an endless loop
+            break
         if (mbi.State == MEM_COMMIT
                 and not (mbi.Protect & PAGE_NOACCESS)
                 and not (mbi.Protect & PAGE_GUARD)):
@@ -281,14 +322,16 @@ def iter_regions(handle):
         address = base + size
 
 
-def read_chunk(handle, base, size):
-    buf = ctypes.create_string_buffer(size)
+def read_chunk(handle, base, size, buf=None):
+    """Read up to `size` bytes. Pass a reusable ctypes buffer (>= size) to avoid
+    allocating and zero-filling a new one - up to 64 MB - for every chunk."""
+    if buf is None or len(buf) < size:
+        buf = ctypes.create_string_buffer(size)
     read = ctypes.c_size_t(0)
-    ok = kernel32.ReadProcessMemory(handle, ctypes.c_void_p(base), buf, size,
-                                    ctypes.byref(read))
+    ok = kernel32.ReadProcessMemory(handle, ctypes.c_void_p(base), buf, size, ctypes.byref(read))
     if not ok and read.value == 0:
         return b""
-    return ctypes.string_at(buf, read.value)     # one copy (buf.raw[:n] made two)
+    return ctypes.string_at(buf, read.value)
 
 
 # --- Keyword-only fast path -------------------------------------------------
@@ -357,7 +400,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
     ascii_re = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
     utf16_re = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % min_len)
     max_chunk = 64 * 1024 * 1024
-    seen_hits, seen_all = set(), set()
+    seen_hits, seen_all = set(), set()      # seen_all stores hashes, not whole strings
     # Keyword-only scans (no "save all strings") can skip listing every string.
     fast = build_fast_matchers(keywords) if (kw_regex and dump_file is None) else None
     total_strings = None if fast else 0
@@ -366,6 +409,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
     try:
         regions = list(iter_regions(handle))
         total_bytes = sum(s for _, s in regions) or 1
+        buf = ctypes.create_string_buffer(min(max_chunk, max((s for _, s in regions), default=1)))
         done_bytes = 0
         for base, size in regions:
             offset = 0
@@ -373,7 +417,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                 if stop.is_set():
                     return total_strings, hits
                 n = min(max_chunk, size - offset)
-                data = read_chunk(handle, base + offset, n)
+                data = read_chunk(handle, base + offset, n, buf)
                 chunk_base = base + offset
                 offset += n
                 done_bytes += n
@@ -390,9 +434,11 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                     if total_strings is not None:
                         total_strings += 1
                     addr = chunk_base + off
-                    if dump_file is not None and text not in seen_all:
-                        seen_all.add(text)
-                        dump_file.write(f"0x{addr:016X}\t{enc}\t{text}\n")
+                    if dump_file is not None:
+                        h = hash(text)
+                        if h not in seen_all:
+                            seen_all.add(h)
+                            dump_file.write(f"0x{addr:016X}\t{enc}\t{text}\n")
                     m = kw_regex.search(text) if kw_regex else None
                     if m:
                         kw = m.group(0).lower()
@@ -417,7 +463,7 @@ def list_modules(pid):
     modules (DLLs + the main exe), or None if the snapshot couldn't be taken
     (process may need admin rights, or may have exited)."""
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
-    if not snap or snap == wt.HANDLE(-1).value:
+    if not snap or snap == INVALID_HANDLE_VALUE:
         return None
     modules = []
     entry = MODULEENTRY32W()
@@ -425,11 +471,10 @@ def list_modules(pid):
     try:
         ok = kernel32.Module32FirstW(snap, ctypes.byref(entry))
         while ok:
-            base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
             modules.append({
                 "name": entry.szModule,
                 "path": entry.szExePath,
-                "base": base,
+                "base": ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0,
                 "size": entry.modBaseSize,
             })
             ok = kernel32.Module32NextW(snap, ctypes.byref(entry))
@@ -439,16 +484,14 @@ def list_modules(pid):
 
 
 def is_system_module_path(path):
-    windir = os.environ.get("WINDIR", r"C:\Windows").lower()
-    return path.lower().startswith(windir)
+    return is_under(path, os.environ.get("WINDIR", r"C:\Windows"))
 
 
 def get_process_exe_dir(pid):
     if not psutil:
         return ""
     try:
-        exe = psutil.Process(pid).exe()
-        return os.path.dirname(exe)
+        return os.path.dirname(psutil.Process(pid).exe())
     except Exception:
         return ""
 
@@ -483,28 +526,24 @@ def parse_recycle_i_file(path):
     return {"deleted_time": deleted_time, "original_path": orig_path, "file_size": file_size}
 
 
+def _listdir_safe(path):
+    try:
+        return os.listdir(path)
+    except OSError:                       # PermissionError is a subclass
+        return []
+
+
 def enumerate_recycle_bin(stop=None):
-    """Yield dicts describing deleted files found in every drive's $Recycle.Bin."""
+    """Return dicts describing deleted files found in every drive's $Recycle.Bin,
+    newest first."""
     results = []
     for drive in list_drives():
         if stop is not None and stop.is_set():
             break
         rb_path = os.path.join(drive, "$Recycle.Bin")
-        if not os.path.isdir(rb_path):
-            continue
-        try:
-            sid_dirs = os.listdir(rb_path)
-        except (PermissionError, OSError):
-            continue
-        for sid in sid_dirs:
+        for sid in _listdir_safe(rb_path):
             sid_path = os.path.join(rb_path, sid)
-            if not os.path.isdir(sid_path):
-                continue
-            try:
-                files = os.listdir(sid_path)
-            except (PermissionError, OSError):
-                continue
-            for fn in files:
+            for fn in _listdir_safe(sid_path):
                 if not fn.startswith("$I"):
                     continue
                 try:
@@ -603,10 +642,8 @@ def _pick_run_count(data, version, nonzero_times):
     """Read the run count. The run-time array holds min(count, 8) non-zero
     entries, so when a version has more than one candidate offset we keep the
     one whose value agrees with that."""
-    candidates = []
-    for off in PF_RUN_COUNT_OFFSETS.get(version, ()):
-        if off + 4 <= len(data):
-            candidates.append(_u32(data, off))
+    candidates = [_u32(data, off) for off in PF_RUN_COUNT_OFFSETS.get(version, ())
+                  if off + 4 <= len(data)]
     plausible = [c for c in candidates if 0 < c <= 1_000_000]
     for c in plausible:
         if min(c, 8) == nonzero_times:
@@ -651,49 +688,41 @@ def parse_prefetch_bytes(data):
     }
 
 
-def enumerate_prefetch():
-    results = []
-    if not os.path.isdir(PREFETCH_DIR):
-        return results
+def _prefetch_entry(fn):
+    """One prefetch row for the .pf file called fn, or None if it can't be stat'ed."""
+    path = os.path.join(PREFETCH_DIR, fn)
     try:
-        entries = os.listdir(PREFETCH_DIR)
-    except (PermissionError, OSError):
-        return results
-    for fn in entries:
-        if not fn.lower().endswith(".pf"):
-            continue
-        path = os.path.join(PREFETCH_DIR, fn)
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        name_part = fn[:-3]
-        prog, _, hash_part = name_part.rpartition("-")
-        if not prog:
-            prog = name_part
-        info = {
-            "program": prog,
-            "hash": hash_part,
-            "created": datetime.fromtimestamp(st.st_ctime),
-            "last_run_fs": datetime.fromtimestamp(st.st_mtime),   # fallback only
-            "last_run": None,       # exact, from inside the file
-            "run_times": [],        # up to 8 most recent runs, newest first
-            "run_count": None,
-            "version": None,
-            "parsed": False,
-            "error": "",
-        }
-        try:
-            with open(path, "rb") as f:
-                parsed = parse_prefetch_bytes(f.read())
-            info["version"] = parsed["version"]
-            info["run_times"] = parsed["run_times"]
-            info["last_run"] = parsed["run_times"][0] if parsed["run_times"] else None
-            info["run_count"] = parsed["run_count"]
-            info["parsed"] = True
-        except Exception as exc:
-            info["error"] = str(exc)
-        results.append(info)
+        st = os.stat(path)
+    except OSError:
+        return None
+    name_part = fn[:-3]
+    prog, _, hash_part = name_part.rpartition("-")
+    info = {
+        "program": prog or name_part,
+        "hash": hash_part,
+        "created": datetime.fromtimestamp(st.st_ctime),
+        "last_run_fs": datetime.fromtimestamp(st.st_mtime),   # fallback only
+        "last_run": None,       # exact, from inside the file
+        "run_times": [],        # up to 8 most recent runs, newest first
+        "run_count": None,
+        "version": None,
+        "parsed": False,
+        "error": "",
+    }
+    try:
+        with open(path, "rb") as f:
+            parsed = parse_prefetch_bytes(f.read())
+        info.update(version=parsed["version"], run_times=parsed["run_times"],
+                    last_run=parsed["run_times"][0] if parsed["run_times"] else None,
+                    run_count=parsed["run_count"], parsed=True)
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def enumerate_prefetch():
+    names = [fn for fn in _listdir_safe(PREFETCH_DIR) if fn.lower().endswith(".pf")]
+    results = [r for r in map(_prefetch_entry, names) if r]
     results.sort(key=lambda r: r["last_run"] or r["last_run_fs"], reverse=True)
     return results
 
@@ -701,20 +730,6 @@ def enumerate_prefetch():
 # ---------------------------------------------------------------------------
 # Process timeline
 # ---------------------------------------------------------------------------
-def find_reference_process_start():
-    """Best-effort: earliest start time among processes that look Minecraft-related."""
-    if not psutil:
-        return None
-    earliest = None
-    for p in psutil.process_iter(["name", "create_time"]):
-        n = (p.info["name"] or "").lower()
-        if any(h in n for h in MC_NAME_HINTS):
-            t = p.info["create_time"]
-            if earliest is None or t < earliest:
-                earliest = t
-    return earliest
-
-
 def list_java_candidates():
     """Return [(pid, name, create_time), ...] for running processes that look
     java/Minecraft-related, oldest first - the pool to pick a reference process from."""
@@ -722,11 +737,16 @@ def list_java_candidates():
         return []
     out = []
     for p in psutil.process_iter(["pid", "name", "create_time"]):
-        n = (p.info["name"] or "")
-        nl = n.lower()
-        if "java" in nl or any(h in nl for h in MC_NAME_HINTS):
-            out.append((p.info["pid"], n, p.info["create_time"]))
+        name = p.info["name"] or ""
+        if any(h in name.lower() for h in MC_NAME_HINTS):
+            out.append((p.info["pid"], name, p.info["create_time"]))
     return sorted(out, key=lambda r: r[2])
+
+
+def find_reference_process_start():
+    """Best-effort: earliest start time among processes that look Minecraft-related."""
+    candidates = list_java_candidates()
+    return candidates[0][2] if candidates else None
 
 
 def list_processes_since(ref_epoch):
@@ -782,11 +802,9 @@ def enumerate_installed_programs():
         except OSError:
             continue
         with root:
-            count = winreg.QueryInfoKey(root)[0]
-            for i in range(count):
+            for i in range(winreg.QueryInfoKey(root)[0]):
                 try:
-                    sub_name = winreg.EnumKey(root, i)
-                    with winreg.OpenKey(root, sub_name) as sub:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as sub:
                         name = _reg_value(sub, "DisplayName")
                         if not name:
                             continue
@@ -817,6 +835,7 @@ HOSTS_WATCH_HINTS = ("mojang", "minecraft", "microsoft", "xboxlive", "xbox", "hy
 # Generic words: only count when they are a whole dot/hyphen-separated label, so
 # "auth.example.com" matches but "oauth.example.com" / "author.blog" do not.
 HOSTS_WEAK_HINTS = {"sentry", "telemetry", "report", "reports", "verify", "auth"}
+HOSTS_DEFAULT = "default (localhost)"
 
 
 def hosts_note_for(host):
@@ -844,22 +863,18 @@ def parse_hosts_file(path=HOSTS_PATH):
         return result
 
     for lineno, raw in enumerate(lines, start=1):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        parts = line.split()
+        parts = raw.split("#", 1)[0].split()
         if len(parts) < 2:
             continue
-        ip, hosts = parts[0], parts[1:]
-        for host in hosts:
-            hl = host.lower()
-            if hl == "localhost":
-                kind = "default (localhost)"
+        ip = parts[0]
+        for host in parts[1:]:
+            if host.lower() == "localhost":
+                kind = HOSTS_DEFAULT
             elif ip in LOOPBACK_IPS:
                 kind = "blocks (points to loopback)"
             else:
                 kind = "redirects to another IP"
-            note = hosts_note_for(host) if kind != "default (localhost)" else ""
+            note = "" if kind == HOSTS_DEFAULT else hosts_note_for(host)
             result["rows"].append({"line": lineno, "ip": ip, "host": host,
                                    "kind": kind, "note": note})
     return result
@@ -916,21 +931,28 @@ def _walk_with_depth_limit(root, max_depth, prune=()):
         yield dirpath, dirnames, filenames
 
 
+def find_dirs(root, names, max_depth=6):
+    """One walk of root -> {name: [matching dirs]} for each name (case-insensitive).
+    Searching for several folder names in a single walk is much cheaper than
+    walking the whole launcher folder once per name."""
+    wanted = {n.lower() for n in names}
+    found = {n: [] for n in wanted}
+    for dirpath, _dn, _fn in _walk_with_depth_limit(root, max_depth, HEAVY_DIRS - wanted):
+        base = os.path.basename(dirpath).lower()
+        if base in found:
+            found[base].append(dirpath)
+    return found
+
+
 def find_dirs_named(root, name, max_depth=6):
-    name_l = name.lower()
-    prune = HEAVY_DIRS - {name_l}
-    return [dp for dp, _dn, _fn in _walk_with_depth_limit(root, max_depth, prune)
-            if os.path.basename(dp).lower() == name_l]
+    return find_dirs(root, [name], max_depth)[name.lower()]
 
 
 def find_files_named(root, filename, max_depth=6):
     name_l = filename.lower()
-    found = []
-    for dirpath, _dn, filenames in _walk_with_depth_limit(root, max_depth, HEAVY_DIRS):
-        for fn in filenames:
-            if fn.lower() == name_l:
-                found.append(os.path.join(dirpath, fn))
-    return found
+    return [os.path.join(dirpath, fn)
+            for dirpath, _dn, filenames in _walk_with_depth_limit(root, max_depth, HEAVY_DIRS)
+            for fn in filenames if fn.lower() == name_l]
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +963,7 @@ VERSION_HASH_CAP = 64 * 1024 * 1024   # game-version jars are bigger, allow more
 JAR_SUFFIXES = (".jar", ".jar.disabled")
 MODS_SUBFOLDER_DEPTH = 1              # also look in mods\<mc version>\ (Forge style)
 MAX_FLAG_WORDS = 6                    # keep the Flags column readable
+JAR_WORKERS = min(8, os.cpu_count() or 4)   # jars are opened + hashed in parallel
 
 _SEP_RE = re.compile(r"[ _\-]+")
 
@@ -976,11 +999,10 @@ def format_flags(hits):
     return " | ".join(parts)
 
 
-def _json_loads(raw):
-    try:
-        return json.loads(raw.decode("utf-8-sig", errors="ignore"), strict=False)
-    except ValueError:
-        return None
+def keyword_hits_in(text, matcher):
+    """{keyword: tier} for every keyword whose normalised form occurs in text."""
+    blob = _norm(text)
+    return {kw: tier for key, (kw, tier) in matcher if key in blob}
 
 
 _TOML_NAME_RE = re.compile(r"^\s*displayName\s*=\s*[\"']([^\"']+)[\"']", re.M)
@@ -1033,10 +1055,9 @@ def read_jar_mod_names(zf, names):
             if m:
                 found.append(m.group(1))
 
-    seen, out = set(), []
+    out = []
     for n in found:
-        if isinstance(n, str) and n.strip() and n not in seen:
-            seen.add(n)
+        if isinstance(n, str) and n.strip() and n.strip() not in out:
             out.append(n.strip())
     return out
 
@@ -1053,15 +1074,14 @@ def inspect_jar(path, matcher, extra_text=()):
     except Exception:
         result["note"] = "not a readable jar/zip"
         names = []
-    candidates = list(names) + [os.path.basename(path), result["info"], *extra_text]
-    blob = _norm("\x00".join(c for c in candidates if c))
-    hits = {kw: tier for key, (kw, tier) in matcher if key in blob}
+    candidates = [c for c in (*names, os.path.basename(path), result["info"], *extra_text) if c]
+    hits = keyword_hits_in("\x00".join(candidates), matcher)
     result["hits"] = hits
     evidence = []
     for kw in sorted(hits, key=lambda k: (-SEVERITY_RANK[hits[k]], k)):
         key = _norm(kw)
         for cand in candidates:
-            if cand and key in _norm(cand):
+            if key in _norm(cand):
                 evidence.append(f"{kw}: {cand}")
                 break
         if len(evidence) >= 3:
@@ -1076,7 +1096,7 @@ def _sha256_of(path, size, cap):
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
+            for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest()
     except OSError:
@@ -1097,15 +1117,10 @@ def describe_jar(path, shown_name, matcher, kind="mod", hash_cap=HASH_SIZE_CAP, 
             "evidence": info["evidence"]}
 
 
-def find_mods_folders(root, max_depth=6):
-    return find_dirs_named(root, "mods", max_depth)
-
-
 def profile_label_for(found_dir, root):
     """Best-effort instance/profile name: the folder just above the found dir,
     falling back further up if that's the launcher root itself."""
-    parent = os.path.dirname(found_dir)
-    label = os.path.basename(parent)
+    label = os.path.basename(os.path.dirname(found_dir))
     root_name = os.path.basename(root.rstrip("\\/"))
     if not label or label.lower() == root_name.lower():
         return "(default/global)"
@@ -1114,27 +1129,29 @@ def profile_label_for(found_dir, root):
 
 def list_jars(mods_dir, matcher=(), subfolder_depth=MODS_SUBFOLDER_DEPTH):
     """Every .jar / .jar.disabled in a mods folder, including one level of
-    subfolders (mods\\1.12.2\\foo.jar). Each row is a describe_jar() dict."""
-    results = []
-    pending = [(mods_dir, 0)]
+    subfolders (mods\\1.12.2\\foo.jar). Each row is a describe_jar() dict.
+    Jars are opened and hashed on a small thread pool (zlib and hashlib release
+    the GIL), which is the slow part for big mod packs."""
+    paths = []
+    pending = deque([(mods_dir, 0)])
     while pending:
-        folder, depth = pending.pop(0)
+        folder, depth = pending.popleft()
         try:
-            entries = sorted(os.listdir(folder))
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: e.name)
         except OSError:
             continue
-        for fn in entries:
-            path = os.path.join(folder, fn)
-            if os.path.isdir(path):
+        for entry in entries:
+            if entry.is_dir():
                 if depth < subfolder_depth:
-                    pending.append((path, depth + 1))
-                continue
-            if not fn.lower().endswith(JAR_SUFFIXES):
-                continue
-            row = describe_jar(path, os.path.relpath(path, mods_dir), matcher)
-            if row:
-                results.append(row)
-    return results
+                    pending.append((entry.path, depth + 1))
+            elif entry.name.lower().endswith(JAR_SUFFIXES):
+                paths.append(entry.path)
+    if not paths:
+        return []
+    with ThreadPoolExecutor(max_workers=JAR_WORKERS) as pool:
+        rows = pool.map(lambda p: describe_jar(p, os.path.relpath(p, mods_dir), matcher), paths)
+        return [r for r in rows if r]
 
 
 def list_versions(versions_dir, matcher=()):
@@ -1168,25 +1185,13 @@ def list_versions(versions_dir, matcher=()):
                 results.append(row)
             continue
         # json-only version (e.g. a Fabric/Forge profile that reuses the vanilla jar)
-        text = _norm("\x00".join(extra))
-        hits = {kw: tier for key, (kw, tier) in matcher if key in text}
-        try:
-            mtime = datetime.fromtimestamp(os.stat(folder).st_mtime)
-        except OSError:
-            mtime = datetime.min
+        hits = keyword_hits_in("\x00".join(extra), matcher)
         results.append({"kind": "version", "file": name, "path": folder, "size": 0,
-                        "modified": mtime, "sha256": "", "info": "; ".join(bits) or "(no jar)",
+                        "modified": _mtime(folder) or datetime.min, "sha256": "",
+                        "info": "; ".join(bits) or "(no jar)",
                         "flags": format_flags(hits), "severity": worst_tier(hits),
                         "evidence": "; ".join(f"{k}: {name}" for k in sorted(hits))[:200]})
     return results
-
-
-def _read_file_head(path, limit=256 * 1024):
-    try:
-        with open(path, "rb") as f:
-            return f.read(limit)
-    except OSError:
-        return b""
 
 
 def scan_mods(roots, tiers=None, include_versions=True, stop=None, progress_cb=None):
@@ -1194,24 +1199,25 @@ def scan_mods(roots, tiers=None, include_versions=True, stop=None, progress_cb=N
     Returns a flat list of rows, flagged ones first, each tagged with its
     launcher and profile/instance."""
     matcher = build_keyword_matcher(tiers or {})
-    jobs = []
+    kinds = ("mods", "versions") if include_versions else ("mods",)
+    jobs, seen = [], set()
     for label, root in roots:
-        for mdir in find_mods_folders(root):
-            jobs.append(("mods", label, root, mdir))
-        if include_versions:
-            for vdir in find_dirs_named(root, "versions"):
-                jobs.append(("versions", label, root, vdir))
+        found = find_dirs(root, kinds)       # one walk finds both folder types
+        for kind in kinds:
+            for d in found[kind]:
+                key = (kind, os.path.normcase(os.path.abspath(d)))
+                if key not in seen:          # overlapping custom + default roots
+                    seen.add(key)
+                    jobs.append((kind, label, root, d))
     total = len(jobs) or 1
     rows = []
     for i, (kind, label, root, folder) in enumerate(jobs):
         if stop is not None and stop.is_set():
             break
         profile = profile_label_for(folder, root)
-        found = list_jars(folder, matcher) if kind == "mods" else list_versions(folder, matcher)
-        for row in found:
-            row["launcher"] = label
-            row["profile"] = profile
-            row["mods_dir"] = folder
+        found_rows = list_jars(folder, matcher) if kind == "mods" else list_versions(folder, matcher)
+        for row in found_rows:
+            row.update(launcher=label, profile=profile, mods_dir=folder)
             rows.append(row)
         if progress_cb:
             progress_cb((i + 1) * 100 / total)
@@ -1223,19 +1229,6 @@ def scan_mods(roots, tiers=None, include_versions=True, stop=None, progress_cb=N
 # ---------------------------------------------------------------------------
 # Shared helpers for the version / crash-report audits
 # ---------------------------------------------------------------------------
-def _win_norm(path):
-    """Lower-cased, backslash-normalised path for prefix comparisons."""
-    return path.replace("/", "\\").lower()
-
-
-def _win_basename(path):
-    return re.split(r"[\\/]", path.rstrip("\\/"))[-1]
-
-
-def _win_dirname(path):
-    return "\\".join(re.split(r"[\\/]", path.rstrip("\\/"))[:-1])
-
-
 # JVM options that load code from outside the game's own jars. Plenty of legitimate
 # software uses some of these (Lunar's own agent, profilers), so a hit is a lead.
 SUSPICIOUS_JVM_ARGS = ("-javaagent", "-agentlib", "-agentpath", "-Xbootclasspath", "-noverify",
@@ -1295,6 +1288,13 @@ def _keyword_hits_in_text(text, matcher):
     return hits, "; ".join(evidence)
 
 
+def _scan_progress(i, total, stop, progress_cb):
+    """Report progress after item i; returns True if the scan should stop."""
+    if progress_cb:
+        progress_cb((i + 1) * 100 / total)
+    return stop is not None and stop.is_set()
+
+
 # ---------------------------------------------------------------------------
 # Version folder audit (versions\<name>\ plus launcher_profiles.json)
 # ---------------------------------------------------------------------------
@@ -1334,11 +1334,28 @@ def sha1_of(path, stop=None):
     return h.hexdigest()
 
 
-def _mtime(path):
-    try:
-        return datetime.fromtimestamp(os.stat(path).st_mtime)
-    except OSError:
-        return None
+def _check_jar_integrity(jar_path, meta, stop):
+    """Compare a version jar with the official client size/SHA-1 Mojang records in
+    the version json. Returns (status text, notes, evidence lines)."""
+    size = os.stat(jar_path).st_size
+    downloads = meta.get("downloads")
+    client = downloads.get("client") if isinstance(downloads, dict) else None
+    want_sha1 = client.get("sha1") if isinstance(client, dict) else None
+    want_size = client.get("size") if isinstance(client, dict) else None
+    if not (isinstance(want_sha1, str) and want_sha1):
+        return "not checkable", [], []
+    if isinstance(want_size, int) and want_size != size:
+        return ("DIFFERS", [("high", f"jar is {size:,} bytes, official is {want_size:,}")],
+                [f"Official size {want_size:,} bytes; actual {size:,} bytes."])
+    if size > VERSION_HASH_CAP:
+        return "too large to hash", [], []
+    actual = sha1_of(jar_path, stop)
+    if actual is None:
+        return "not checked", [], []
+    if actual.lower() == want_sha1.lower():
+        return "matches official", [], []
+    return ("DIFFERS", [("high", "jar SHA-1 differs from the official value in its own json")],
+            [f"Expected SHA-1 {want_sha1}; actual {actual}."])
 
 
 def audit_version_folder(folder, launcher, profile, matcher, stop=None):
@@ -1377,31 +1394,12 @@ def audit_version_folder(folder, launcher, profile, matcher, stop=None):
         notes.append(("context", f"JVM arg: {arg[:80]}"))
         evidence.append(f"JVM argument in the version json: {arg}")
 
-    # Compare the jar with the official client hash Mojang records in the json itself.
     size, integrity = None, "not checkable"
     if has_jar:
         size = os.stat(jar_path).st_size
-        downloads = meta.get("downloads")
-        client = downloads.get("client") if isinstance(downloads, dict) else None
-        want_sha1 = client.get("sha1") if isinstance(client, dict) else None
-        want_size = client.get("size") if isinstance(client, dict) else None
-        if isinstance(want_sha1, str) and want_sha1:
-            if isinstance(want_size, int) and want_size != size:
-                integrity = "DIFFERS"
-                notes.append(("high", f"jar is {size:,} bytes, official is {want_size:,}"))
-                evidence.append(f"Official size {want_size:,} bytes; actual {size:,} bytes.")
-            elif size > VERSION_HASH_CAP:
-                integrity = "too large to hash"
-            else:
-                actual = sha1_of(jar_path, stop)
-                if actual is None:
-                    integrity = "not checked"
-                elif actual.lower() == want_sha1.lower():
-                    integrity = "matches official"
-                else:
-                    integrity = "DIFFERS"
-                    notes.append(("high", "jar SHA-1 differs from the official value in its own json"))
-                    evidence.append(f"Expected SHA-1 {want_sha1}; actual {actual}.")
+        integrity, int_notes, int_evidence = _check_jar_integrity(jar_path, meta, stop)
+        notes += int_notes
+        evidence += int_evidence
 
     # Keyword check (same tiers as the Mods Scanner): folder name, json fields, jar contents.
     extra = [name, vid, inherits, main]
@@ -1411,8 +1409,7 @@ def audit_version_folder(folder, launcher, profile, matcher, stop=None):
         if info["note"]:
             notes.append(("context", info["note"]))
     else:
-        text = _norm("\x00".join(x for x in extra if x))
-        hits = {kw: tier for key, (kw, tier) in matcher if key in text}
+        hits = keyword_hits_in("\x00".join(x for x in extra if x), matcher)
         kw_evidence = "; ".join(f"{k}: {name}" for k in sorted(hits))
     if kw_evidence:
         evidence.append("Keyword evidence: " + kw_evidence)
@@ -1441,13 +1438,13 @@ def audit_launcher_profiles(path, launcher, matcher):
         java_args = str(prof.get("javaArgs") or "")
         java_dir = str(prof.get("javaDir") or "")
         game_dir = str(prof.get("gameDir") or "")
-        notes, evidence = [], []
-        for arg in find_suspicious_jvm_args(java_args.split())[:3]:
-            notes.append(("context", f"JVM arg: {arg[:80]}"))
+        notes = [("context", f"JVM arg: {arg[:80]}")
+                 for arg in find_suspicious_jvm_args(java_args.split())[:3]]
         if java_dir:
             notes.append(("context", f"custom Java executable: {java_dir[:80]}"))
-        text = _norm("\x00".join(x for x in (name, version_id, java_args, java_dir, game_dir) if x))
-        hits = {kw: tier for key2, (kw, tier) in matcher if key2 in text}
+        hits = keyword_hits_in(
+            "\x00".join(x for x in (name, version_id, java_args, java_dir, game_dir) if x), matcher)
+        evidence = []
         if java_args:
             evidence.append(f"javaArgs: {redact_secrets(java_args)[:400]}")
         if java_dir:
@@ -1467,40 +1464,38 @@ def scan_versions(roots, tiers=None, stop=None, progress_cb=None):
     """roots: [(label, path), ...] -> rows, flagged ones first."""
     matcher = build_keyword_matcher(tiers or {})
     jobs, seen = [], set()
+
+    def claim(path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
     for label, root in roots:
         for vdir in find_dirs_named(root, "versions"):
-            key = os.path.normcase(os.path.abspath(vdir))
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                subfolders = sorted(os.listdir(vdir))
-            except OSError:
+            if not claim(vdir):
                 continue
             profile = profile_label_for(vdir, root)
-            for sub in subfolders:
+            for sub in sorted(_listdir_safe(vdir)):
                 folder = os.path.join(vdir, sub)
                 if os.path.isdir(folder):
                     jobs.append(("version", label, profile, folder))
         profiles_json = os.path.join(root, "launcher_profiles.json")
-        key = os.path.normcase(os.path.abspath(profiles_json))
-        if os.path.isfile(profiles_json) and key not in seen:
-            seen.add(key)
+        if os.path.isfile(profiles_json) and claim(profiles_json):
             jobs.append(("profiles", label, "", profiles_json))
 
     rows = []
     total = len(jobs) or 1
     for i, (kind, label, profile, target) in enumerate(jobs):
-        if stop is not None and stop.is_set():
-            break
         if kind == "version":
             row = audit_version_folder(target, label, profile, matcher, stop)
             if row:
                 rows.append(row)
         else:
             rows.extend(audit_launcher_profiles(target, label, matcher))
-        if progress_cb:
-            progress_cb((i + 1) * 100 / total)
+        if _scan_progress(i, total, stop, progress_cb):
+            break
     rows.sort(key=lambda r: (-SEVERITY_RANK[r["severity"]], r["launcher"].lower(),
                              r["kind"], r["file"].lower()))
     return rows
@@ -1566,7 +1561,7 @@ def _dll_findings(untrusted, crashed_module=""):
     evidence += [f"  {p}" for p in untrusted[:MAX_EVIDENCE_PATHS]]
     if len(untrusted) > MAX_EVIDENCE_PATHS:
         evidence.append(f"  ... and {len(untrusted) - MAX_EVIDENCE_PATHS} more")
-    if crashed_module and any(_win_basename(p).lower() == crashed_module.lower() for p in untrusted):
+    if crashed_module and any(n.lower() == crashed_module.lower() for n in names):
         notes.insert(0, ("context", f"crashed inside {crashed_module}, which is outside system/Java folders"))
     return notes, evidence
 
@@ -1668,12 +1663,12 @@ def audit_crash_file(label, kind, path, matcher):
     when, summary = None, ""
     if kind == KIND_MC:
         summary, jvm_flags, when = analyze_mc_crash(text, os.path.basename(path))
-        for arg in find_suspicious_jvm_args(jvm_flags)[:3]:
-            notes.append(("context", f"JVM flag: {arg[:80]}"))
+        notes += [("context", f"JVM flag: {arg[:80]}")
+                  for arg in find_suspicious_jvm_args(jvm_flags)[:3]]
     elif kind == KIND_HS:
         summary, problem, jvm_args, libs = analyze_hs_err(text)
-        for arg in find_suspicious_jvm_args(jvm_args)[:3]:
-            notes.append(("context", f"JVM arg: {arg[:80]}"))
+        notes += [("context", f"JVM arg: {arg[:80]}")
+                  for arg in find_suspicious_jvm_args(jvm_args)[:3]]
         exe = next((p for p in libs if _win_norm(p).endswith(("\\javaw.exe", "\\java.exe"))), "")
         java_home = _win_dirname(_win_dirname(exe)) if exe else ""
         dll_notes, dll_evidence = _dll_findings(untrusted_dlls(libs, java_home), problem)
@@ -1737,13 +1732,12 @@ def scan_crash_reports(roots, tiers=None, stop=None, progress_cb=None):
     rows = []
     total = len(files) or 1
     for i, (label, kind, path) in enumerate(files):
-        if stop is not None and stop.is_set():
-            break
         row = audit_crash_file(label, kind, path, matcher)
         if row:
             rows.append(row)
-        if progress_cb:
-            progress_cb((i + 1) * 100 / total)
+        if _scan_progress(i, total, stop, progress_cb):
+            break
+    # flagged first, then newest first
     rows.sort(key=lambda r: (-SEVERITY_RANK[r["severity"]], -r["time"].timestamp()
                              if r["time"] > datetime.min else 0))
     return rows
@@ -1767,71 +1761,42 @@ class NBTReader:
         self.pos += n
         return b
 
-    def read_byte(self):
-        return struct.unpack(">b", self._read(1))[0]
-
-    def read_short(self):
-        return struct.unpack(">h", self._read(2))[0]
-
-    def read_int(self):
-        return struct.unpack(">i", self._read(4))[0]
-
-    def read_long(self):
-        return struct.unpack(">q", self._read(8))[0]
-
-    def read_float(self):
-        return struct.unpack(">f", self._read(4))[0]
-
-    def read_double(self):
-        return struct.unpack(">d", self._read(8))[0]
+    def _unpack(self, fmt):
+        return struct.unpack(fmt, self._read(struct.calcsize(fmt)))[0]
 
     def read_string(self):
-        length = struct.unpack(">H", self._read(2))[0]
-        return self._read(length).decode("utf-8", errors="replace")
+        return self._read(self._unpack(">H")).decode("utf-8", errors="replace")
 
     def read_payload(self, tag_type):
-        if tag_type == 1:
-            return self.read_byte()
-        if tag_type == 2:
-            return self.read_short()
-        if tag_type == 3:
-            return self.read_int()
-        if tag_type == 4:
-            return self.read_long()
-        if tag_type == 5:
-            return self.read_float()
-        if tag_type == 6:
-            return self.read_double()
-        if tag_type == 7:
-            n = self.read_int()
-            return self._read(max(n, 0))
+        scalar = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}.get(tag_type)
+        if scalar:
+            return self._unpack(scalar)
+        if tag_type == 7:                                   # byte array
+            return self._read(max(self._unpack(">i"), 0))
         if tag_type == 8:
             return self.read_string()
-        if tag_type == 9:
-            item_type = self.read_byte()
-            n = self.read_int()
+        if tag_type == 9:                                   # list
+            item_type = self._unpack(">b")
+            n = self._unpack(">i")
             if item_type == 0 or n <= 0:
                 return []
             return [self.read_payload(item_type) for _ in range(n)]
-        if tag_type == 10:
+        if tag_type == 10:                                  # compound
             compound = {}
             while True:
-                t = self.read_byte()
+                t = self._unpack(">b")
                 if t == 0:
                     break
                 name = self.read_string()
                 compound[name] = self.read_payload(t)
             return compound
-        if tag_type == 11:
-            n = self.read_int()
-            return [self.read_int() for _ in range(max(n, 0))]
-        if tag_type == 12:
-            n = self.read_int()
-            return [self.read_long() for _ in range(max(n, 0))]
+        if tag_type in (11, 12):                            # int array / long array
+            item = ">i" if tag_type == 11 else ">q"
+            return [self._unpack(item) for _ in range(max(self._unpack(">i"), 0))]
         raise ValueError(f"unknown NBT tag type {tag_type}")
 
     def read_root(self):
-        t = self.read_byte()
+        t = self._unpack(">b")
         if t == 0:
             return None
         self.read_string()  # root tag name, unused
@@ -1853,22 +1818,23 @@ def get_servers_from_file(path):
         return []
     if not isinstance(root, dict):
         return []
-    out = []
-    for s in root.get("servers", []) or []:
-        if isinstance(s, dict):
-            out.append({"name": s.get("name", ""), "ip": s.get("ip", "")})
-    return out
+    return [{"name": s.get("name", ""), "ip": s.get("ip", "")}
+            for s in root.get("servers") or [] if isinstance(s, dict)]
 
 
 def scan_servers(roots, max_depth=6):
     """roots: [(label, path), ...]. Returns rows: launcher, profile, name, ip, source file."""
-    rows = []
+    rows, seen = [], set()
     for label, root in roots:
         for dat_path in find_files_named(root, "servers.dat", max_depth):
+            key = os.path.normcase(os.path.abspath(dat_path))
+            if key in seen:
+                continue
+            seen.add(key)
             profile = profile_label_for(os.path.dirname(dat_path), root)
             for s in get_servers_from_file(dat_path):
                 rows.append({"launcher": label, "profile": profile, "name": s["name"],
-                            "ip": s["ip"], "source": dat_path})
+                             "ip": s["ip"], "source": dat_path})
     return rows
 
 
@@ -1897,7 +1863,7 @@ LOG_LINE_PATTERNS = [
     re.compile(r"UUID of player (?P<name>[A-Za-z0-9_]{3,16}) is"),
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16})\[/[\d.]+:\d+\] logged in"),
     re.compile(r"(?P<name>[A-Za-z0-9_]{3,16}) has (?:made the advancement|"
-              r"completed the challenge|reached the goal)"),
+               r"completed the challenge|reached the goal)"),
 ]
 TIME_PREFIX_RE = re.compile(r"\[(\d{2}:\d{2}:\d{2})\]")
 
@@ -1913,6 +1879,7 @@ LOG_TRIGGER_RE = re.compile(
     r"joined the game|left the game|UUID of player|logged in|"
     r"has made the advancement|has completed the challenge|has reached the goal|"
     r"<[A-Za-z0-9_]{3,16}>|Setting user:")
+LOG_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 
 def get_default_log_paths():
@@ -1937,9 +1904,6 @@ def extract_matches(line):
     return out
 
 
-LOG_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
-
-
 def _safe_mtime(path):
     try:
         return os.path.getmtime(path)
@@ -1947,13 +1911,13 @@ def _safe_mtime(path):
         return 0
 
 
-def log_file_date(path):
+def log_file_date(path, mtime=None):
     """'YYYY-MM-DD' for a log file: from its name (2025-03-01-2.log.gz), otherwise
     from its modified time (latest.log and client-specific names)."""
     m = LOG_DATE_RE.match(os.path.basename(path))
     if m:
         return m.group(1)
-    mt = _safe_mtime(path)
+    mt = _safe_mtime(path) if mtime is None else mtime
     return datetime.fromtimestamp(mt).strftime("%Y-%m-%d") if mt else ""
 
 
@@ -1961,11 +1925,9 @@ def iter_log_files(root):
     if os.path.isfile(root):
         yield root
         return
-    if not os.path.isdir(root):
-        return
-    for dirpath, _dirs, filenames in os.walk(root):
+    for dirpath, _dirs, filenames in os.walk(root):     # os.walk on a non-dir yields nothing
         for fn in filenames:
-            if fn.endswith(".log") or fn.endswith(".log.gz"):
+            if fn.endswith((".log", ".log.gz")):
                 yield os.path.join(dirpath, fn)
 
 
@@ -1994,12 +1956,15 @@ def scan_logs(paths, stop=None, progress_cb=None):
     files = set()
     for p in paths:
         files.update(iter_log_files(p))
-    files = sorted(files, key=lambda f: (log_file_date(f), _safe_mtime(f)))
-    total = len(files) or 1
-    for i, path in enumerate(files):
+    keyed = []
+    for f in files:                         # one stat per file, not one per sort comparison
+        mt = _safe_mtime(f)
+        keyed.append((log_file_date(f, mt), mt, f))
+    keyed.sort()
+    total = len(keyed) or 1
+    for i, (day, _mt, path) in enumerate(keyed):
         if stop is not None and stop.is_set():
             break
-        day = log_file_date(path)
         base = os.path.basename(path)
         for line in read_log_lines(path):
             if not LOG_TRIGGER_RE.search(line):
@@ -2122,10 +2087,13 @@ def scan_account_files(paths):
 # Layout of this section:
 #   1. Small shared helpers (CSV export, admin prompt, plural text)
 #   2. Reusable widgets: PathPicker, ProcessPicker
-#   3. Base classes:  TableTab  ->  ScanTab
+#   3. Base classes:  TableTab -> ScanTab -> RootsScanTab -> AuditTab
 #   4. The tabs themselves (most are ~20-40 lines because the base classes do
 #      the UI building, background threading, filtering and exporting)
 #   5. App window + theming
+#
+# To add a tab: subclass ScanTab (or RootsScanTab / AuditTab if it searches
+# launcher folders), fill in the class attributes + hooks, and add one line to TABS.
 # ===========================================================================
 
 CSV_TYPES = [("CSV", "*.csv"), ("Text", "*.txt")]
@@ -2147,9 +2115,10 @@ def plural(n, one, many):
 
 
 def offer_admin_restart(widget):
+    """Offer to relaunch elevated; only closes this window if the UAC prompt was accepted."""
     if messagebox.askyesno("Run as admin", "Restart this tool with administrator rights?"):
-        relaunch_as_admin()
-        widget.winfo_toplevel().destroy()
+        if relaunch_as_admin():
+            widget.winfo_toplevel().destroy()
 
 
 def admin_status_label(parent):
@@ -2157,6 +2126,16 @@ def admin_status_label(parent):
     ok = is_admin()
     return ttk.Label(parent, text="Running as admin" if ok else "Not admin",
                      foreground="green" if ok else "gray")
+
+
+def shared_keyword_tiers(widget):
+    """The Memory Scan tab's (possibly edited) keyword box, so there is one list to
+    maintain; falls back to the defaults."""
+    tiers = parse_keyword_lines(DEFAULT_KEYWORDS)
+    mem = getattr(widget.winfo_toplevel(), "tabs", {}).get("Memory Scan")
+    if mem is not None:
+        tiers = mem.get_keywords() or tiers
+    return tiers
 
 
 # ---------------------------------------------------------------------------
@@ -2329,6 +2308,7 @@ class TableTab(ttk.Frame):
     SELECT_MODE = "extended"
     HAS_DETAIL = False        # True -> a read-only box under the table shows detail_text(row)
     DETAIL_HEIGHT = 5
+    FILTER_DELAY_MS = 150
 
     def __init__(self, parent):
         super().__init__(parent, padding=self.PADDING)
@@ -2363,6 +2343,13 @@ class TableTab(ttk.Frame):
     def export_rows(self):
         return self.rows
 
+    def detail_text(self, row):
+        return ""
+
+    def row_tags(self, row):
+        """Treeview tags for a row: 'high' / 'context' colour it (see _apply_theme)."""
+        return ()
+
     def search_text(self, row):
         return " ".join(str(row[k]) for k in self.SEARCH_KEYS).lower()
 
@@ -2370,7 +2357,16 @@ class TableTab(ttk.Frame):
         return not f or f in self.search_text(row)
 
     def sort_key(self, row, col):
-        return str(row.get(col, "")).lower()
+        """Sort key for one cell. Tuples keep mixed types (None, numbers, dates, text)
+        from ever being compared with each other."""
+        v = row.get(col)
+        if v is None:
+            return (0, 0)
+        if isinstance(v, (int, float)):
+            return (1, v)
+        if isinstance(v, datetime):
+            return (2, v)
+        return (3, str(v).lower())
 
     def sort_starts_descending(self, col):
         return False
@@ -2394,9 +2390,6 @@ class TableTab(ttk.Frame):
             self.tree.bind("<<TreeviewSelect>>", self.show_detail)
             self.detail = tk.Text(self, height=self.DETAIL_HEIGHT, wrap="word", state="disabled")
             self.detail.pack(fill="x", pady=(8, 0))
-
-    def detail_text(self, row):
-        return ""
 
     def show_detail(self, _event=None):
         sel = self.tree.selection()
@@ -2450,14 +2443,8 @@ class TableTab(ttk.Frame):
         f = self.current_filter()
         return [r for r in self.rows if self.is_visible(r, f)]
 
-    def row_tags(self, row):
-        """Treeview tags for a row: 'high' / 'context' colour it (see _apply_theme)."""
-        return ()
-
     def insert_row(self, row):
         self.tree.insert("", "end", values=self.row_values(row), tags=self.row_tags(row))
-
-    FILTER_DELAY_MS = 150
 
     def schedule_filter(self):
         """Rebuild the table once typing pauses, not on every keystroke."""
@@ -2466,7 +2453,9 @@ class TableTab(ttk.Frame):
         self._filter_job = self.after(self.FILTER_DELAY_MS, self.apply_filter)
 
     def apply_filter(self):
-        self._filter_job = None
+        if self._filter_job is not None:
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
         self.tree.delete(*self.tree.get_children())
         for row in self.visible_rows():
             self.insert_row(row)
@@ -2535,6 +2524,9 @@ class ScanTab(TableTab):
     def on_scan_done(self, rows):
         pass
 
+    def build_extra_controls(self, ctl):
+        pass
+
     # ---- control bar ------------------------------------------------------
     def build_controls(self, ctl):
         self.scan_btn = ttk.Button(ctl, text=self.SCAN_LABEL, command=self.start_scan)
@@ -2546,9 +2538,6 @@ class ScanTab(TableTab):
         if self.HAS_PROGRESS:
             self.progress = ttk.Progressbar(ctl, length=200, maximum=100)
             self.progress.pack(side="right")
-
-    def build_extra_controls(self, ctl):
-        pass
 
     def report_progress(self, pct):
         """Safe to call from the worker thread."""
@@ -2576,8 +2565,7 @@ class ScanTab(TableTab):
         try:
             rows = self.scan(*args)
         except Exception as exc:
-            rows = []
-            msg = str(exc)
+            rows, msg = [], str(exc)
             self.after(0, lambda: messagebox.showerror(self.ERROR_TITLE, msg))
         if self.THREADED:
             self.after(0, lambda: self._finish(rows))
@@ -2589,6 +2577,71 @@ class ScanTab(TableTab):
         self.set_rows(rows)
         self.scan_btn.config(state="normal")
         self.set_status(self.done_message(rows))
+
+
+# ---------------------------------------------------------------------------
+# Base class 3: RootsScanTab - a ScanTab that searches launcher folders
+# Base class 4: AuditTab    - ... and flags rows against the keyword list
+# ---------------------------------------------------------------------------
+class RootsScanTab(ScanTab):
+    """ScanTab with a 'Search locations' picker (launcher folders by default).
+    prepare_scan() returns (roots,) - or (roots, keyword tiers) when USES_KEYWORDS."""
+
+    PICKER_TITLE = "Search locations"
+    PICKER_DEFAULT_CAPTION = "Default launcher folders (unchecked ones weren't found):"
+    PICKER_CUSTOM_CAPTION = "Custom launcher/instance folder:"
+    USES_KEYWORDS = False
+    keyword_count = 0
+
+    def picker_defaults(self):
+        return get_default_client_roots()
+
+    def build_top(self):
+        self.picker = add_path_picker(
+            self, self.PICKER_TITLE, defaults=self.picker_defaults(),
+            default_caption=self.PICKER_DEFAULT_CAPTION,
+            custom_caption=self.PICKER_CUSTOM_CAPTION)
+
+    def keyword_tiers(self):
+        return shared_keyword_tiers(self)
+
+    def prepare_scan(self):
+        roots = self.picker.selected()
+        if not roots:
+            messagebox.showwarning("No locations",
+                                   "Select at least one default folder or add a custom one.")
+            return None
+        if not self.USES_KEYWORDS:
+            return (roots,)
+        tiers = self.keyword_tiers()
+        self.keyword_count = len(tiers)
+        return (roots, tiers)
+
+
+class AuditTab(RootsScanTab):
+    """Rows carry 'flags' / 'severity' / 'evidence'; red = high, amber = context."""
+
+    USES_KEYWORDS = True
+    HAS_PROGRESS = True
+    SORTABLE = True
+    HAS_DETAIL = True
+    DESCENDING_COLS = ("flags",)        # columns whose first click sorts biggest-first
+
+    def row_tags(self, r):
+        return (r["severity"],) if r["severity"] else ()
+
+    def sort_key(self, r, col):
+        if col == "flags":
+            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
+        return super().sort_key(r, col)
+
+    def sort_starts_descending(self, col):
+        return col in self.DESCENDING_COLS
+
+    def flag_summary(self, rows):
+        high = sum(1 for r in rows if r["severity"] == "high")
+        ctx = sum(1 for r in rows if r["severity"] == "context")
+        return f"{high} red, {ctx} amber ({self.keyword_count} keywords checked)"
 
 
 # ===========================================================================
@@ -2609,6 +2662,8 @@ class MemoryScanTab(TableTab):
     EXPORT_HEADER = [c[0] for c in COLUMNS]
     EMPTY_EXPORT_TEXT = "Nothing to export yet."
     SELECT_MODE = "browse"
+    HAS_DETAIL = True
+    DETAIL_HEIGHT = 4
 
     def init_state(self):
         self.q = queue.Queue()
@@ -2664,11 +2719,6 @@ class MemoryScanTab(TableTab):
         self.progress = ttk.Progressbar(ctl, length=220, maximum=100)
         self.progress.pack(side="right")
 
-    def build_after_table(self):
-        self.tree.bind("<<TreeviewSelect>>", self.show_detail)
-        self.detail = tk.Text(self, height=4, wrap="word", state="disabled")
-        self.detail.pack(fill="x", pady=(8, 0))
-
     # ---- rows are plain tuples here ---------------------------------------
     def _tier(self, kw):
         return self.kw_tiers.get(kw, "high")
@@ -2686,6 +2736,10 @@ class MemoryScanTab(TableTab):
 
     def export_row(self, row):
         return list(row)
+
+    def detail_text(self, row):
+        _t, _pid, addr, enc, kw, text = row
+        return f"{addr} [{enc}] kw='{kw}' ({self._tier(kw)})\n{text}"
 
     # ---- keywords ----------------------------------------------------------
     def get_keywords(self):
@@ -2776,25 +2830,35 @@ class MemoryScanTab(TableTab):
         self.q.put(("done", " | ".join(summary), stamp, log_dir))
 
     def _poll_queue(self):
+        """Drain the worker's queue on the UI thread. Hits are inserted in one batch
+        per poll, and the progress bar / status are only touched once each."""
+        progress = status = done = None
+        f = self.current_filter()
         try:
             while True:
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "hit":
                     self.rows.append(msg[1])
-                    if self.is_visible(msg[1], self.current_filter()):
+                    if self.is_visible(msg[1], f):
                         self.insert_row(msg[1])
                 elif kind == "progress":
-                    self.progress["value"] = msg[1]
+                    progress = msg[1]
                 elif kind == "status":
-                    self.set_status(msg[1])
+                    status = msg[1]
                 elif kind == "done":
-                    self._finish(msg[1], msg[2], msg[3])
+                    done = msg
         except queue.Empty:
             pass
+        if progress is not None:
+            self.progress["value"] = progress
+        if status is not None:
+            self.set_status(status)
+        if done is not None:
+            self._on_done(*done[1:])
         self.after(100, self._poll_queue)
 
-    def _finish(self, summary, stamp, log_dir):
+    def _on_done(self, summary, stamp, log_dir):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
@@ -2802,20 +2866,7 @@ class MemoryScanTab(TableTab):
         state = "Stopped" if self.stop_event.is_set() else "Done"
         self.set_status(f"{state}. {summary or 'No data.'}  Log saved: {log_path}")
 
-    # ---- details, clear, export -------------------------------------------
-    def show_detail(self, _event=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        idx = self.tree.index(sel[0])
-        visible = self.visible_rows()
-        if idx < len(visible):
-            row = visible[idx]
-            self.detail.config(state="normal")
-            self.detail.delete("1.0", "end")
-            self.detail.insert("1.0", f"{row[2]} [{row[3]}] kw='{row[4]}' ({self._tier(row[4])})\n{row[5]}")
-            self.detail.config(state="disabled")
-
+    # ---- clear, export -----------------------------------------------------
     def clear_results(self):
         self.rows.clear()
         self.tree.delete(*self.tree.get_children())
@@ -2890,7 +2941,7 @@ class DLLScannerTab(ScanTab):
         for m in modules:
             if is_system_module_path(m["path"]):
                 location = "system"
-            elif game_dir and m["path"].lower().startswith(game_dir.lower()):
+            elif is_under(m["path"], game_dir):
                 location = "game folder"
             else:
                 location = "other"
@@ -2904,7 +2955,7 @@ class DLLScannerTab(ScanTab):
         return (m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"])
 
     def export_row(self, m):
-        return [m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"]]
+        return list(self.row_values(m))
 
 
 # ---------------------------------------------------------------------------
@@ -2934,7 +2985,7 @@ class RecycleBinTab(ScanTab):
         return (fmt_dt(r["deleted_time"]), r["original_path"], r["file_size"], r["drive"], r["sid"])
 
     def export_row(self, r):
-        return [fmt_dt(r["deleted_time"]), r["original_path"], r["file_size"], r["drive"], r["sid"]]
+        return list(self.row_values(r))
 
 
 # ---------------------------------------------------------------------------
@@ -2995,7 +3046,7 @@ class PrefetchTab(ScanTab):
 # ---------------------------------------------------------------------------
 # Mods Scanner tab
 # ---------------------------------------------------------------------------
-class ModsScannerTab(ScanTab):
+class ModsScannerTab(AuditTab):
     NOTE = ("Finds every \"mods\" folder under each launcher's data folder (including per-profile "
             "ones like CurseForge, Modrinth App and Dawn, and one level of subfolders such as "
             "mods\\1.12.2) and, optionally, the installed game versions. Each jar is opened and "
@@ -3015,18 +3066,11 @@ class ModsScannerTab(ScanTab):
     SCAN_LABEL = "Scan mods"
     BUSY_TEXT = "Scanning for mods folders and opening jars..."
     ERROR_TITLE = "Mods scan failed"
-    HAS_PROGRESS = True
-    SORTABLE = True
-
-    def init_state(self):
-        super().init_state()
-        self.keyword_count = 0
+    DESCENDING_COLS = ("flags", "size", "modified")
+    DETAIL_HEIGHT = 4
 
     def build_top(self):
-        self.picker = add_path_picker(
-            self, "Search locations", defaults=get_default_client_roots(),
-            default_caption="Default launcher folders (unchecked ones weren't found):",
-            custom_caption="Custom launcher/instance folder:")
+        super().build_top()
         opt = ttk.Frame(self)
         opt.pack(fill="x", pady=(8, 0))
         self.include_versions = tk.BooleanVar(value=True)
@@ -3039,97 +3083,45 @@ class ModsScannerTab(ScanTab):
         self.extra_kw = tk.StringVar()
         ttk.Entry(row, textvariable=self.extra_kw, width=40).pack(side="left", padx=6)
 
-    def build_after_table(self):
-        self.tree.bind("<<TreeviewSelect>>", self.show_detail)
-        self.detail = tk.Text(self, height=4, wrap="word", state="disabled")
-        self.detail.pack(fill="x", pady=(8, 0))
-
-    def _keyword_tiers(self):
-        """Use the Memory Scan tab's (possibly edited) keyword box so there is one list
-        to maintain; fall back to the defaults. Extra keywords are added on top."""
-        tiers = parse_keyword_lines(DEFAULT_KEYWORDS)
-        mem = getattr(self.winfo_toplevel(), "tabs", {}).get("Memory Scan")
-        if mem is not None:
-            tiers = mem.get_keywords() or tiers
+    def keyword_tiers(self):
+        """The shared keyword list plus this scan's extra keywords."""
+        tiers = super().keyword_tiers()
         for kw, tier in parse_keyword_lines(self.extra_kw.get().split(",")).items():
             if tiers.get(kw) != "high":
                 tiers[kw] = tier
         return tiers
 
     def prepare_scan(self):
-        roots = self.picker.selected()
-        if not roots:
-            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return None
-        return (roots, self._keyword_tiers(), self.include_versions.get())
+        args = super().prepare_scan()
+        return None if args is None else (*args, self.include_versions.get())
 
     def scan(self, roots, tiers, include_versions):
-        self.keyword_count = len(tiers)
         return scan_mods(roots, tiers, include_versions, self.stop_event, self.report_progress)
 
     def done_message(self, rows):
-        high = sum(1 for r in rows if r["severity"] == "high")
-        ctx = sum(1 for r in rows if r["severity"] == "context")
         mods = sum(1 for r in rows if r["kind"] == "mod")
         return (f"Found {mods} mod jar(s) and {len(rows) - mods} game version(s); "
-                f"{high} flagged red, {ctx} amber ({self.keyword_count} keywords checked).")
+                f"{self.flag_summary(rows)}.")
 
     def row_values(self, m):
         return (m["flags"], m["file"], m["info"], m["kind"], m["launcher"], m["profile"],
                 m["size"], fmt_dt(m["modified"]), m["sha256"])
 
-    def row_tags(self, m):
-        return (m["severity"],) if m["severity"] else ()
-
     def export_row(self, m):
         return [m["flags"], m["kind"], m["launcher"], m["profile"], m["file"], m["info"],
                 m["size"], fmt_dt(m["modified"]), m["sha256"], m["evidence"], m["path"]]
 
-    def sort_key(self, r, col):
-        if col == "flags":
-            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
-        if col == "size":
-            return r["size"]
-        if col == "modified":
-            return r["modified"]
-        return str(r.get(col, "")).lower()
-
-    def sort_starts_descending(self, col):
-        return col in ("flags", "size", "modified")
-
-    def show_detail(self, _event=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        visible = self.visible_rows()
-        idx = self.tree.index(sel[0])
-        if idx >= len(visible):
-            return
-        m = visible[idx]
-        text = (f"{m['path']}\n"
+    def detail_text(self, m):
+        return (f"{m['path']}\n"
                 f"Flags: {m['flags'] or 'none'}\n"
                 f"Evidence: {m['evidence'] or '-'}\n"
                 f"SHA-256: {m['sha256'] or '-'}")
-        self.detail.config(state="normal")
-        self.detail.delete("1.0", "end")
-        self.detail.insert("1.0", text)
-        self.detail.config(state="disabled")
 
 
 # ---------------------------------------------------------------------------
 # Versions Audit tab (installed game versions + launcher profiles)
 # ---------------------------------------------------------------------------
-def shared_keyword_tiers(widget):
-    """The Memory Scan tab's (possibly edited) keyword box, so there is one list to
-    maintain; falls back to the defaults."""
-    tiers = parse_keyword_lines(DEFAULT_KEYWORDS)
-    mem = getattr(widget.winfo_toplevel(), "tabs", {}).get("Memory Scan")
-    if mem is not None:
-        tiers = mem.get_keywords() or tiers
-    return tiers
-
-
-class VersionsAuditTab(ScanTab):
+class VersionsAuditTab(AuditTab):
     NOTE = ("Audits every installed game version (versions\\<name>\\) and every launcher profile. "
             "For vanilla versions the jar is compared with the official SHA-1 that Mojang records "
             "in the version's own json - a modified jar shows as DIFFERS (red). Amber flags are "
@@ -3145,64 +3137,28 @@ class VersionsAuditTab(ScanTab):
     SEARCH_KEYS = ("flags", "file", "kind", "integrity", "launcher", "profile", "inherits", "main_class")
     EXPORT_HEADER = ["flags", "kind", "official_hash", "launcher", "profile", "name", "inherits_or_uses",
                      "main_class", "jar_size_bytes", "modified_or_last_used", "details", "full_path"]
+    PICKER_CUSTOM_CAPTION = "Custom launcher/instance folder (or a versions folder itself):"
     SCAN_LABEL = "Scan versions"
     BUSY_TEXT = "Auditing version folders and launcher profiles..."
     ERROR_TITLE = "Versions audit failed"
-    HAS_PROGRESS = True
-    SORTABLE = True
-    HAS_DETAIL = True
-
-    def init_state(self):
-        super().init_state()
-        self.keyword_count = 0
-
-    def build_top(self):
-        self.picker = add_path_picker(
-            self, "Search locations", defaults=get_default_client_roots(),
-            default_caption="Default launcher folders (unchecked ones weren't found):",
-            custom_caption="Custom launcher/instance folder (or a versions folder itself):")
-
-    def prepare_scan(self):
-        roots = self.picker.selected()
-        if not roots:
-            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return None
-        return (roots, shared_keyword_tiers(self))
+    DESCENDING_COLS = ("flags", "size", "modified")
 
     def scan(self, roots, tiers):
-        self.keyword_count = len(tiers)
         return scan_versions(roots, tiers, self.stop_event, self.report_progress)
 
     def done_message(self, rows):
-        high = sum(1 for r in rows if r["severity"] == "high")
-        ctx = sum(1 for r in rows if r["severity"] == "context")
         versions = sum(1 for r in rows if r["kind"] == "version")
         return (f"Checked {versions} version folder(s) and {len(rows) - versions} launcher profile(s); "
-                f"{high} red, {ctx} amber ({self.keyword_count} keywords checked).")
+                f"{self.flag_summary(rows)}.")
 
     def row_values(self, r):
         return (r["flags"], r["file"], r["kind"], r["integrity"], r["launcher"], r["inherits"],
                 r["main_class"], "-" if r["size"] is None else r["size"], fmt_dt(r["modified"]))
 
-    def row_tags(self, r):
-        return (r["severity"],) if r["severity"] else ()
-
     def export_row(self, r):
         return [r["flags"], r["kind"], r["integrity"], r["launcher"], r["profile"], r["file"],
                 r["inherits"], r["main_class"], "" if r["size"] is None else r["size"],
                 fmt_dt(r["modified"]), r["evidence"], r["path"]]
-
-    def sort_key(self, r, col):
-        if col == "flags":
-            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
-        if col == "size":
-            return -1 if r["size"] is None else r["size"]
-        if col == "modified":
-            return r["modified"]
-        return str(r.get(col, "")).lower()
-
-    def sort_starts_descending(self, col):
-        return col in ("flags", "size", "modified")
 
     def detail_text(self, r):
         return (f"{r['path']}\nFlags: {r['flags'] or 'none'}\nOfficial hash: {r['integrity']}\n"
@@ -3212,7 +3168,7 @@ class VersionsAuditTab(ScanTab):
 # ---------------------------------------------------------------------------
 # Crash Reports tab (Minecraft crash reports, JVM hs_err logs, Windows Error Reports)
 # ---------------------------------------------------------------------------
-class CrashReportsTab(ScanTab):
+class CrashReportsTab(AuditTab):
     NOTE = ("Reads crash evidence already on disk: Minecraft's crash-reports folder, JVM fatal-error "
             "logs (hs_err_pid*.log) and Windows Error Reporting entries for java. A crash often "
             "names code that was injected into the game: the keyword list (from Memory Scan) is "
@@ -3225,59 +3181,29 @@ class CrashReportsTab(ScanTab):
     STRETCH = "summary"
     SEARCH_KEYS = ("flags", "file", "kind", "launcher", "summary")
     EXPORT_HEADER = ["flags", "time", "type", "source", "file", "summary", "details", "full_path"]
+    PICKER_DEFAULT_CAPTION = "Default locations (unchecked ones weren't found):"
+    PICKER_CUSTOM_CAPTION = ("Custom launcher/instance folder "
+                             "(searched for crash-reports and hs_err files):")
     SCAN_LABEL = "Scan crash reports"
     BUSY_TEXT = "Reading crash reports..."
     ERROR_TITLE = "Crash report scan failed"
-    HAS_PROGRESS = True
-    SORTABLE = True
-    HAS_DETAIL = True
+    DESCENDING_COLS = ("flags", "time")
 
-    def init_state(self):
-        super().init_state()
-        self.keyword_count = 0
-
-    def build_top(self):
-        self.picker = add_path_picker(
-            self, "Search locations", defaults=get_default_crash_roots(),
-            default_caption="Default locations (unchecked ones weren't found):",
-            custom_caption="Custom launcher/instance folder (searched for crash-reports and hs_err files):")
-
-    def prepare_scan(self):
-        roots = self.picker.selected()
-        if not roots:
-            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return None
-        return (roots, shared_keyword_tiers(self))
+    def picker_defaults(self):
+        return get_default_crash_roots()
 
     def scan(self, roots, tiers):
-        self.keyword_count = len(tiers)
         return scan_crash_reports(roots, tiers, self.stop_event, self.report_progress)
 
     def done_message(self, rows):
-        high = sum(1 for r in rows if r["severity"] == "high")
-        ctx = sum(1 for r in rows if r["severity"] == "context")
-        return (f"Found {plural(len(rows), 'crash report', 'crash reports')}; {high} red, {ctx} amber "
-                f"({self.keyword_count} keywords checked).")
+        return f"Found {plural(len(rows), 'crash report', 'crash reports')}; {self.flag_summary(rows)}."
 
     def row_values(self, r):
         return (r["flags"], fmt_dt(r["time"]), r["kind"], r["launcher"], r["file"], r["summary"])
 
-    def row_tags(self, r):
-        return (r["severity"],) if r["severity"] else ()
-
     def export_row(self, r):
         return [r["flags"], fmt_dt(r["time"]), r["kind"], r["launcher"], r["file"], r["summary"],
                 r["evidence"], r["path"]]
-
-    def sort_key(self, r, col):
-        if col == "flags":
-            return (SEVERITY_RANK[r["severity"]], r["flags"].lower())
-        if col == "time":
-            return r["time"]
-        return str(r.get(col, "")).lower()
-
-    def sort_starts_descending(self, col):
-        return col in ("flags", "time")
 
     def detail_text(self, r):
         return (f"{r['path']}\nFlags: {r['flags'] or 'none'}\nSummary: {r['summary'] or '-'}\n"
@@ -3287,7 +3213,7 @@ class CrashReportsTab(ScanTab):
 # ---------------------------------------------------------------------------
 # Servers tab (recent/saved servers across launchers and profiles)
 # ---------------------------------------------------------------------------
-class ServersTab(ScanTab):
+class ServersTab(RootsScanTab):
     NOTE = ("Reads servers.dat (the multiplayer server list) from every "
             "launcher/instance folder found, including profile-based "
             "launchers where each instance keeps its own list.")
@@ -3300,19 +3226,6 @@ class ServersTab(ScanTab):
     BUSY_TEXT = "Scanning for servers.dat files..."
     ERROR_TITLE = "Server scan failed"
 
-    def build_top(self):
-        self.picker = add_path_picker(
-            self, "Search locations", defaults=get_default_client_roots(),
-            default_caption="Default launcher folders (unchecked ones weren't found):",
-            custom_caption="Custom launcher/instance folder:")
-
-    def prepare_scan(self):
-        roots = self.picker.selected()
-        if not roots:
-            messagebox.showwarning("No locations", "Select at least one default folder or add a custom one.")
-            return None
-        return (roots,)
-
     def scan(self, roots):
         return scan_servers(roots)
 
@@ -3323,7 +3236,7 @@ class ServersTab(ScanTab):
         return (r["launcher"], r["profile"], r["name"], r["ip"], r["source"])
 
     def export_row(self, r):
-        return [r["launcher"], r["profile"], r["name"], r["ip"], r["source"]]
+        return list(self.row_values(r))
 
 
 # ---------------------------------------------------------------------------
@@ -3352,11 +3265,6 @@ class InstalledProgramsTab(ScanTab):
 
     def done_message(self, rows):
         return f"Found {plural(len(rows), 'installed program entry', 'installed program entries')}."
-
-    def sort_key(self, r, col):
-        if col == "key_modified":
-            return r["key_modified"] or datetime.min
-        return str(r[col]).lower()
 
     def sort_starts_descending(self, col):
         return col == "key_modified"
@@ -3400,7 +3308,7 @@ class HostsCheckTab(ScanTab):
     def done_message(self, rows):
         if self.result["error"]:
             return f"Couldn't read the hosts file: {self.result['error']}"
-        extra = [r for r in rows if r["kind"] != "default (localhost)"]
+        extra = [r for r in rows if r["kind"] != HOSTS_DEFAULT]
         stamp = f"Last modified {fmt_dt(self.result['modified'])}, {self.result['size']} bytes."
         if extra:
             return f"{plural(len(extra), 'active entry', 'active entries')} beyond localhost. {stamp}"
@@ -3480,11 +3388,10 @@ class ProcessTimelineTab(TableTab):
             self.set_status("psutil unavailable - can't list processes.")
             return
         self.java_proc_map = {}
-        labels = []
         for pid, name, ct in list_java_candidates():
             label = f"{name}  (PID {pid})  started {datetime.fromtimestamp(ct).strftime('%H:%M:%S')}"
             self.java_proc_map[label] = (pid, ct)
-            labels.append(label)
+        labels = list(self.java_proc_map)
         self.java_combo["values"] = labels
         if labels:
             self.java_combo.current(0)
@@ -3539,7 +3446,11 @@ class ProcessTimelineTab(TableTab):
     def _auto_tick(self):
         self.refresh()
         if self.auto_var.get():
-            self.auto_job = self.after(max(2, self.interval.get()) * 1000, self._auto_tick)
+            try:
+                seconds = max(2, int(self.interval.get()))
+            except (ValueError, tk.TclError):      # box cleared / non-numeric mid-edit
+                seconds = 5
+            self.auto_job = self.after(seconds * 1000, self._auto_tick)
 
 
 # ---------------------------------------------------------------------------
@@ -3567,10 +3478,14 @@ class LogsPanel(ScanTab):
     ERROR_TITLE = "Log scan failed"
     HAS_PROGRESS = True
 
+    ACCOUNT_COLUMNS = (("account", "Account", 170), ("sessions", "Launches", 70),
+                       ("first_seen", "First seen", 140), ("last_seen", "Last seen", 140),
+                       ("files", "Seen in file(s)", 300))
+
     def init_state(self):
         super().init_state()
         self.local_accounts = {}            # accounts that launched the game (shown below)
-        self.local_names = set()            # names shown as "likely you"
+        self.local_lower = set()            # lower-cased names, for "likely you" / exclusion
         self.pending_local_accounts = {}    # set by the worker, applied in on_scan_done
 
     def build_top(self):
@@ -3594,10 +3509,6 @@ class LogsPanel(ScanTab):
         self.local_names_label = ttk.Label(ef, text="Launching accounts: none yet (scan first)",
                                            foreground="gray")
         self.local_names_label.pack(anchor="w")
-
-    ACCOUNT_COLUMNS = (("account", "Account", 170), ("sessions", "Launches", 70),
-                       ("first_seen", "First seen", 140), ("last_seen", "Last seen", 140),
-                       ("files", "Seen in file(s)", 300))
 
     def build_after_table(self):
         box = ttk.LabelFrame(
@@ -3653,14 +3564,14 @@ class LogsPanel(ScanTab):
 
     def on_scan_done(self, rows):
         self.local_accounts = self.pending_local_accounts
-        self.local_names = set(self.local_accounts)
+        self.local_lower = {n.lower() for n in self.local_accounts}
         self.acct_tree.delete(*self.acct_tree.get_children())
         for values in self._account_rows():
             self.acct_tree.insert("", "end", values=values)
-        if self.local_names:
+        if self.local_accounts:
             normal_fg = ttk.Style(self).lookup("TLabel", "foreground") or "black"
             self.local_names_label.config(
-                text="Launching account(s): " + ", ".join(sorted(self.local_names)),
+                text="Launching account(s): " + ", ".join(sorted(self.local_accounts)),
                 foreground=normal_fg)
         else:
             self.local_names_label.config(
@@ -3668,7 +3579,7 @@ class LogsPanel(ScanTab):
                 foreground="gray")
 
     def done_message(self, rows):
-        n = len(self.local_names)
+        n = len(self.local_accounts)
         msg = f"Found {len(rows)} unique username(s) across the scanned logs. "
         if n > 1:
             return msg + f"{n} different accounts launched the game on this PC - worth a look."
@@ -3676,10 +3587,10 @@ class LogsPanel(ScanTab):
 
     # ---- filtering / display ----------------------------------------------
     def _excluded_set(self):
-        manual = {n.strip().lower() for n in self.exclude_var.get().split(",") if n.strip()}
+        excluded = {n.strip().lower() for n in self.exclude_var.get().split(",") if n.strip()}
         if self.auto_exclude_local.get():
-            manual |= {n.lower() for n in self.local_names}
-        return manual
+            excluded |= self.local_lower
+        return excluded
 
     def visible_rows(self):
         f = self.current_filter()
@@ -3692,7 +3603,7 @@ class LogsPanel(ScanTab):
         return [r for r in self.rows if r["name"].lower() not in excluded]
 
     def _likely_you(self, r):
-        return "yes" if r["name"].lower() in {n.lower() for n in self.local_names} else ""
+        return "yes" if r["name"].lower() in self.local_lower else ""
 
     def row_values(self, r):
         return (r["name"], self._likely_you(r), r["count"], ", ".join(sorted(r["files"])),
@@ -3719,6 +3630,7 @@ class AccountsPanel(ScanTab):
     BUSY_TEXT = "Scanning launcher account files..."
     ERROR_TITLE = "Account scan failed"
     HAS_FILTER = False
+    file_count = 0
 
     def build_top(self):
         self.picker = PathPicker(
@@ -3751,19 +3663,20 @@ class AccountsPanel(ScanTab):
 
 
 class LogCheckerTab(ttk.Frame):
+    """Both panels in one vertically scrollable page."""
+
     def __init__(self, parent):
         super().__init__(parent, padding=0)
-        self.scroll_canvas = tk.Canvas(self, highlightthickness=0)
-        canvas = self.scroll_canvas
+        self.canvas = canvas = tk.Canvas(self, highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         body = ttk.Frame(canvas, padding=8)
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"), add="+")
+        canvas.bind_all("<MouseWheel>", self._on_wheel, add="+")
 
         self.logs = LogsPanel(body)
         self.logs.pack(fill="both", expand=True)
@@ -3772,6 +3685,20 @@ class LogCheckerTab(ttk.Frame):
         box.pack(fill="x", pady=(16, 0))
         self.accounts = AccountsPanel(box)
         self.accounts.pack(fill="x")
+
+    def _on_wheel(self, event):
+        """Scroll this page only when the pointer is over it - and not over a table,
+        text box or list that scrolls itself. (A bare bind_all would scroll this page
+        while the user is on any other tab.)"""
+        try:
+            under = self.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):         # tkinter bug with combobox popups
+            return
+        if under is None or not str(under).startswith(str(self)):
+            return
+        if isinstance(under, (ttk.Treeview, tk.Text, tk.Listbox)):
+            return
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
 class CreditsTab(ttk.Frame):
@@ -3830,7 +3757,6 @@ class App(tk.Tk):
         # "vista" is natively drawn and only partially respects color overrides, which
         # is what caused light mode text/background to look broken after a theme switch.
         # "clam" honors every color we set, so both modes render consistently.
-        self.light_theme = "clam"
         self.dark_mode = tk.BooleanVar(value=False)
 
         top = ttk.Frame(self)
@@ -3852,7 +3778,7 @@ class App(tk.Tk):
             nb.add(tab, text=title)
             self.tabs[title] = tab
 
-        self._apply_theme(LIGHT_COLORS, self.light_theme)
+        self._apply_theme(LIGHT_COLORS)
 
         if psutil is None:
             messagebox.showwarning(
@@ -3862,14 +3788,11 @@ class App(tk.Tk):
                 "install manually with: pip install psutil")
 
     def toggle_dark_mode(self):
-        if self.dark_mode.get():
-            self._apply_theme(DARK_COLORS, "clam")
-        else:
-            self._apply_theme(LIGHT_COLORS, self.light_theme)
+        self._apply_theme(DARK_COLORS if self.dark_mode.get() else LIGHT_COLORS)
 
-    def _apply_theme(self, c, theme_name):
+    def _apply_theme(self, c):
         s = self.style
-        s.theme_use(theme_name)
+        s.theme_use("clam")
         s.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field_bg"])
         for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
                      "TCheckbutton", "TNotebook"):
@@ -3901,14 +3824,12 @@ class App(tk.Tk):
         whole widget tree and recolor those by hand. New tabs get this for free."""
         for child in widget.winfo_children():
             try:
-                if isinstance(child, tk.Text):
-                    child.configure(bg=c["field_bg"], fg=c["fg"], insertbackground=c["fg"],
-                                    selectbackground=c["select"], selectforeground=c["select_fg"],
-                                    highlightthickness=0)
-                elif isinstance(child, tk.Listbox):      # Listbox has no insertbackground option
-                    child.configure(bg=c["field_bg"], fg=c["fg"],
-                                    selectbackground=c["select"], selectforeground=c["select_fg"],
-                                    highlightthickness=0)
+                if isinstance(child, (tk.Text, tk.Listbox)):
+                    opts = dict(bg=c["field_bg"], fg=c["fg"], highlightthickness=0,
+                                selectbackground=c["select"], selectforeground=c["select_fg"])
+                    if isinstance(child, tk.Text):       # Listbox has no insertbackground option
+                        opts["insertbackground"] = c["fg"]
+                    child.configure(**opts)
                 elif isinstance(child, tk.Canvas):
                     child.configure(bg=c["bg"])
                 elif isinstance(child, ttk.Treeview):    # severity colours for flagged rows
