@@ -21,7 +21,7 @@ nothing here captures keystrokes or runs hidden/in the background.
 A match or entry is a lead to review, not proof of cheating.
 
 Just run: python Scarf_SS_tool.py
-Missing dependencies (psutil) are installed automatically on first launch.
+Missing dependencies (psutil, sv-ttk) are installed automatically on first launch.
 
 Code layout: backend scanners first, then the GUI. Every table tab is built on
 the TableTab / ScanTab base classes - see the "GUI" section for how to add one.
@@ -31,6 +31,13 @@ import sys
 
 if sys.platform != "win32":
     sys.exit("This tool only works on Windows.")
+
+# Version info. build.py reads and bumps these (python build.py --bump).
+APP_NAME = "Scarf's SS Tool"
+APP_VERSION = "2.0"
+APP_STAGE = "Beta"          # "Beta", or "" for a stable release
+VERSION_LABEL = f"{APP_VERSION} {APP_STAGE}".strip()
+FROZEN = getattr(sys, "frozen", False)      # True when running as the built .exe
 
 import csv
 import ctypes
@@ -45,6 +52,7 @@ import re
 import string
 import struct
 import subprocess
+import tempfile
 import threading
 import winreg
 import zipfile
@@ -52,13 +60,19 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+# Folder next to the script, or next to the .exe when built (a one-file exe's
+# __file__ points at a temp folder that is deleted on exit).
+APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
+
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
 # ---------------------------------------------------------------------------
-REQUIRED = {"psutil": "psutil"}  # import name -> pip package name
+REQUIRED = {"psutil": "psutil", "sv_ttk": "sv-ttk"}  # import name -> pip package name
 
 
 def ensure_dependencies():
+    if FROZEN:      # the exe already bundles everything; pip would re-launch the exe
+        return
     missing = []
     for module, package in REQUIRED.items():
         try:
@@ -90,6 +104,11 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+try:
+    import sv_ttk          # Sun Valley theme: Windows 11 look for plain ttk widgets
+except ImportError:
+    sv_ttk = None          # falls back to the built-in "clam" theme
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -215,7 +234,7 @@ def is_admin():
 def relaunch_as_admin():
     """Ask Windows to restart this script elevated. Returns False if the user
     declined the UAC prompt (ShellExecute returns <= 32 on failure)."""
-    args = [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    args = sys.argv[1:] if FROZEN else [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
     params = " ".join(f'"{a}"' for a in args)
     return ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1) > 32
 
@@ -341,6 +360,9 @@ def read_chunk(handle, base, size, buf=None):
 # only then grow each hit into the full string around it. Measured ~4x faster
 # with identical results. Used only when "save all strings" is off.
 MAX_CONTEXT = 2000        # how far to look left/right of a hit for the string's edges
+CHUNK_OVERLAP = 4096      # extra bytes read either side of a chunk so strings that straddle
+                          # a chunk boundary are seen whole (must be > MAX_CONTEXT)
+IS_32BIT_PYTHON = ctypes.sizeof(ctypes.c_void_p) == 4
 
 
 def build_fast_matchers(keywords):
@@ -408,8 +430,16 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
 
     try:
         regions = list(iter_regions(handle))
+        if not regions:
+            hint = (" This is 32-bit Python, which can't read a 64-bit game - install 64-bit "
+                    "Python or use the 64-bit exe." if IS_32BIT_PYTHON else
+                    " Try 'Run as admin', or the process may have just exited.")
+            q.put(("status", f"No readable memory found in PID {pid}.{hint}"))
+            return total_strings, hits
         total_bytes = sum(s for _, s in regions) or 1
-        buf = ctypes.create_string_buffer(min(max_chunk, max((s for _, s in regions), default=1)))
+        # Each read is a chunk plus overlap on both sides, never more than its region.
+        buf = ctypes.create_string_buffer(
+            min(max_chunk + 2 * CHUNK_OVERLAP, max(s for _, s in regions)))
         done_bytes = 0
         for base, size in regions:
             offset = 0
@@ -417,8 +447,13 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                 if stop.is_set():
                     return total_strings, hits
                 n = min(max_chunk, size - offset)
-                data = read_chunk(handle, base + offset, n, buf)
-                chunk_base = base + offset
+                # Read a little before and after the chunk so a string (or keyword) that
+                # straddles a boundary is found whole. Only strings that START inside the
+                # chunk proper are kept below, so nothing is reported twice.
+                lead = min(CHUNK_OVERLAP, offset)
+                tail = min(CHUNK_OVERLAP, size - offset - n)
+                chunk_base = base + offset - lead
+                data = read_chunk(handle, chunk_base, lead + n + tail, buf)
                 offset += n
                 done_bytes += n
                 if not data:
@@ -431,6 +466,8 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                     found += [(m.start(), m.group().decode("utf-16le"), "utf16")
                               for m in utf16_re.finditer(data)]
                 for off, text, enc in found:
+                    if off < lead or off >= lead + n:
+                        continue                  # belongs to the neighbouring chunk
                     if total_strings is not None:
                         total_strings += 1
                     addr = chunk_base + off
@@ -438,7 +475,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                         h = hash(text)
                         if h not in seen_all:
                             seen_all.add(h)
-                            dump_file.write(f"0x{addr:016X}\t{enc}\t{text}\n")
+                            dump_file.write(f"0x{addr:016X}\t{enc}\t{redact_secrets(text)}\n")
                     m = kw_regex.search(text) if kw_regex else None
                     if m:
                         kw = m.group(0).lower()
@@ -448,7 +485,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                         seen_hits.add(key)
                         hits += 1
                         q.put(("hit", (datetime.now().strftime("%H:%M:%S"), pid,
-                                       f"0x{addr:016X}", enc, kw, text)))
+                                       f"0x{addr:016X}", enc, kw, redact_secrets(text))))
                 q.put(("progress", done_bytes * 100 / total_bytes))
     finally:
         kernel32.CloseHandle(handle)
@@ -1239,10 +1276,40 @@ _SUSPICIOUS_LOWER = tuple(a.lower() for a in SUSPICIOUS_JVM_ARGS)
 # displayed or exported: anything that looks like one is replaced before it is shown.
 _SECRET_ARG_RE = re.compile(
     r"(--(?:accessToken|session|xuid|clientId|userProperties)(?:=|\s+))\S+", re.I)
+# Older game versions log "Session ID is token:<token>:<uuid>"; JWT-shaped values are
+# caught too, wherever they turn up (memory strings, crash reports, logs).
+_TOKEN_RE = re.compile(r"(token:)[\w.\-]+|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}", re.I)
 
 
 def redact_secrets(text):
-    return _SECRET_ARG_RE.sub(r"\1<hidden>", text)
+    text = _SECRET_ARG_RE.sub(r"\1<hidden>", text)
+    return _TOKEN_RE.sub(lambda m: (m.group(1) or "") + "<hidden>", text)
+
+
+def csv_safe(value):
+    """Stop spreadsheet apps from running text taken from the inspected PC as a
+    formula (cells starting with = + - @)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def get_log_dir():
+    """APP_DIR/logs if it can be written to, else a folder in the temp directory
+    (the tool may be run from a read-only location or a locked-down USB stick).
+    Returns None if neither works."""
+    for base, name in ((APP_DIR, "logs"), (tempfile.gettempdir(), "ScarfSSTool_logs")):
+        path = os.path.join(base, name)
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write_test")   # os.access() is unreliable on Windows
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return path
+        except OSError:
+            continue
+    return None
 
 
 def find_suspicious_jvm_args(args):
@@ -2749,16 +2816,24 @@ class MemoryScanTab(TableTab):
     def load_keywords(self):
         path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All", "*.*")])
         if path:
-            with open(path, "r", encoding="utf-8") as f:
-                self.kw_text.delete("1.0", "end")
-                self.kw_text.insert("1.0", f.read())
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                    text = f.read()
+            except OSError as exc:
+                messagebox.showerror("Load keywords", f"Could not read that file:\n{exc}")
+                return
+            self.kw_text.delete("1.0", "end")
+            self.kw_text.insert("1.0", text)
 
     def save_keywords(self):
         path = filedialog.asksaveasfilename(defaultextension=".txt",
                                             filetypes=[("Text files", "*.txt")])
         if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(keyword_lines(self.get_keywords())))
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(keyword_lines(self.get_keywords())))
+            except OSError as exc:
+                messagebox.showerror("Save keywords", f"Could not save that file:\n{exc}")
 
     def reset_keywords(self):
         self.kw_text.delete("1.0", "end")
@@ -2807,13 +2882,16 @@ class MemoryScanTab(TableTab):
 
     def _worker(self, pids, kw_regex, min_len, dump_all):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = get_log_dir()
         dump_file = None
-        if dump_all:
-            dump_file = open(os.path.join(log_dir, f"allstrings_{stamp}.txt"), "w", encoding="utf-8")
         summary = []
         try:
+            if dump_all:
+                if log_dir:
+                    dump_file = open(os.path.join(log_dir, f"allstrings_{stamp}.txt"), "w",
+                                     encoding="utf-8")
+                else:
+                    summary.append("no writable folder for the all-strings dump (skipped)")
             for pid in pids:
                 if self.stop_event.is_set():
                     break
@@ -2825,46 +2903,57 @@ class MemoryScanTab(TableTab):
         except Exception as exc:
             summary.append(f"Error: {exc}")
         finally:
+            # Always tell the UI we're finished, even if setup or a scan failed -
+            # otherwise the Start button would stay disabled forever.
             if dump_file:
                 dump_file.close()
-        self.q.put(("done", " | ".join(summary), stamp, log_dir))
+            self.q.put(("done", " | ".join(summary), stamp, log_dir))
 
     def _poll_queue(self):
         """Drain the worker's queue on the UI thread. Hits are inserted in one batch
         per poll, and the progress bar / status are only touched once each."""
-        progress = status = done = None
-        f = self.current_filter()
         try:
-            while True:
-                msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "hit":
-                    self.rows.append(msg[1])
-                    if self.is_visible(msg[1], f):
-                        self.insert_row(msg[1])
-                elif kind == "progress":
-                    progress = msg[1]
-                elif kind == "status":
-                    status = msg[1]
-                elif kind == "done":
-                    done = msg
-        except queue.Empty:
-            pass
-        if progress is not None:
-            self.progress["value"] = progress
-        if status is not None:
-            self.set_status(status)
-        if done is not None:
-            self._on_done(*done[1:])
-        self.after(100, self._poll_queue)
+            progress = status = done = None
+            f = self.current_filter()
+            try:
+                while True:
+                    msg = self.q.get_nowait()
+                    kind = msg[0]
+                    if kind == "hit":
+                        self.rows.append(msg[1])
+                        if self.is_visible(msg[1], f):
+                            self.insert_row(msg[1])
+                    elif kind == "progress":
+                        progress = msg[1]
+                    elif kind == "status":
+                        status = msg[1]
+                    elif kind == "done":
+                        done = msg
+            except queue.Empty:
+                pass
+            if progress is not None:
+                self.progress["value"] = progress
+            if status is not None:
+                self.set_status(status)
+            if done is not None:
+                self._on_done(*done[1:])
+        finally:
+            # Reschedule no matter what, so one error can't freeze the tab for good.
+            self.after(100, self._poll_queue)
 
     def _on_done(self, summary, stamp, log_dir):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
-        log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
-        self._write_log(log_path)
+        saved = "Log not saved (no writable folder)."
+        if log_dir:
+            log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
+            try:
+                self._write_log(log_path)
+                saved = f"Log saved: {log_path}"
+            except OSError as exc:
+                saved = f"Log not saved ({exc})."
         state = "Stopped" if self.stop_event.is_set() else "Done"
-        self.set_status(f"{state}. {summary or 'No data.'}  Log saved: {log_path}")
+        self.set_status(f"{state}. {summary or 'No data.'}  {saved}")
 
     # ---- clear, export -----------------------------------------------------
     def clear_results(self):
@@ -2877,7 +2966,7 @@ class MemoryScanTab(TableTab):
             if path.lower().endswith(".csv"):
                 w = csv.writer(f)
                 w.writerow(self.EXPORT_HEADER + ["level"])
-                w.writerows(list(r) + [self._tier(r[4])] for r in self.rows)
+                w.writerows([csv_safe(c) for c in r] + [self._tier(r[4])] for r in self.rows)
             else:
                 f.write(f"# SS string log - {datetime.now().isoformat()}\n")
                 f.write("# Matches are leads to review, not proof of cheating.\n")
@@ -2892,7 +2981,11 @@ class MemoryScanTab(TableTab):
         path = filedialog.asksaveasfilename(
             defaultextension=".txt", filetypes=[("Text log", "*.txt"), ("CSV", "*.csv")])
         if path:
-            self._write_log(path)
+            try:
+                self._write_log(path)
+            except OSError as exc:
+                messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+                return
             self.set_status(f"Exported {len(self.rows)} rows to {path}")
 
 
@@ -3712,7 +3805,7 @@ class CreditsTab(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent, padding=24)
-        ttk.Label(self, text="Scarf's SS Tool 1.0", font=("Segoe UI", 18, "bold")
+        ttk.Label(self, text=f"{APP_NAME} {VERSION_LABEL}", font=("Segoe UI", 18, "bold")
                   ).pack(pady=(16, 4))
         ttk.Label(self, text="Credits", font=("Segoe UI", 13, "bold")).pack(pady=(24, 10))
         for name in self.NAMES:
@@ -3722,10 +3815,16 @@ class CreditsTab(ttk.Frame):
 # ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
-LIGHT_COLORS = dict(bg="#f0f0f0", fg="#000000", field_bg="#ffffff", select="#3399ff",
-                    select_fg="#ffffff", high="#c62828", context="#a15c00")
-DARK_COLORS = dict(bg="#1e1e1e", fg="#e6e6e6", field_bg="#2b2b2b", select="#3a6ea5",
-                   select_fg="#ffffff", high="#ff6b6b", context="#e0a030")
+# Palettes follow the Sun Valley (Windows 11) theme so classic tk widgets
+# (Text / Listbox / Canvas / sidebar) match the ttk ones.
+LIGHT_COLORS = dict(bg="#fafafa", fg="#1a1a1a", field_bg="#ffffff", select="#005fb8",
+                    select_fg="#ffffff", high="#c62828", context="#a15c00",
+                    border="#d0d0d0", accent="#005fb8", hover="#f0f0f0",
+                    active="#e4e4e4", muted="#707070")
+DARK_COLORS = dict(bg="#1c1c1c", fg="#f2f2f2", field_bg="#2b2b2b", select="#57c8ff",
+                   select_fg="#000000", high="#ff6b6b", context="#e0a030",
+                   border="#404040", accent="#57c8ff", hover="#282828",
+                   active="#363636", muted="#a0a0a0")
 
 # (tab title, tab class) in display order - add a new tab by adding a line here.
 TABS = [
@@ -3743,42 +3842,72 @@ TABS = [
     ("Process Timeline", ProcessTimelineTab),
     ("Credits", CreditsTab),
 ]
+PINNED_BOTTOM = {"Credits"}      # these sidebar entries sit at the bottom
+
+
+class SidebarItem(tk.Frame):
+    """One clickable sidebar entry: accent bar + label, with hover/selected states."""
+
+    def __init__(self, parent, text, command):
+        super().__init__(parent, cursor="hand2")
+        self.selected = False
+        self.hovered = False
+        self.colors = LIGHT_COLORS
+        self.bar = tk.Frame(self, width=3)
+        self.bar.pack(side="left", fill="y", pady=6)
+        self.label = tk.Label(self, text=text, anchor="w", font=("Segoe UI", 10),
+                              padx=12, pady=7)
+        self.label.pack(side="left", fill="x", expand=True)
+        for w in (self, self.bar, self.label):
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: self._set_hover())
+            w.bind("<Leave>", lambda e: self.after_idle(self._set_hover))
+
+    def _set_hover(self):
+        try:
+            under = self.winfo_containing(*self.winfo_pointerxy())
+        except (KeyError, tk.TclError):
+            return
+        hovered = under is not None and (under is self or str(under).startswith(str(self) + "."))
+        if hovered != self.hovered:
+            self.hovered = hovered
+            self.apply(self.colors)
+
+    def set_selected(self, selected):
+        self.selected = selected
+        self.apply(self.colors)
+
+    def apply(self, c):
+        self.colors = c
+        bg = c["active"] if self.selected else (c["hover"] if self.hovered else c["bg"])
+        self.configure(bg=bg)
+        self.label.configure(bg=bg, fg=c["fg"])
+        self.bar.configure(bg=c["accent"] if self.selected else bg)
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Scarf's SS Tool 1.0")
-        self.geometry("1150x750")
-        self.minsize(950, 600)
+        self.title(f"{APP_NAME} {VERSION_LABEL}")
+        self.geometry("1200x780")
+        self.minsize(1000, 640)
 
         self.style = ttk.Style(self)
-        # Always use "clam" (not the native "vista" theme) for BOTH light and dark mode.
-        # "vista" is natively drawn and only partially respects color overrides, which
-        # is what caused light mode text/background to look broken after a theme switch.
-        # "clam" honors every color we set, so both modes render consistently.
         self.dark_mode = tk.BooleanVar(value=False)
+        self.colors = LIGHT_COLORS
+        self.current = None
+        self.items = {}      # title -> SidebarItem
+        self.tabs = {}       # title -> tab widget
 
-        top = ttk.Frame(self)
-        top.pack(fill="x")
-        banner = ttk.Label(
-            top,
-            text=("Scarf's SS Tool 1.0 - for use during a screenshare the other person has "
-                  "agreed to. Results are leads to review, not proof of cheating."),
-            anchor="w", padding=4, foreground="#888")
-        banner.pack(side="left", fill="x", expand=True)
-        ttk.Checkbutton(top, text="Dark mode", variable=self.dark_mode,
-                        command=self.toggle_dark_mode).pack(side="right", padx=8)
+        self._build_sidebar()
+        ttk.Separator(self, orient="vertical").pack(side="left", fill="y")
+        self._build_main()
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
-        self.tabs = {}
-        for title, tab_class in TABS:
-            tab = tab_class(nb)
-            nb.add(tab, text=title)
-            self.tabs[title] = tab
-
+        self.show_tab(TABS[0][0])
         self._apply_theme(LIGHT_COLORS)
+
+        self.bind("<Control-Next>", lambda e: self._step_tab(1))
+        self.bind("<Control-Prior>", lambda e: self._step_tab(-1))
 
         if psutil is None:
             messagebox.showwarning(
@@ -3787,15 +3916,112 @@ class App(tk.Tk):
                 "Recycle Bin tabs still work; Process Timeline needs psutil - "
                 "install manually with: pip install psutil")
 
+    # ---- layout -----------------------------------------------------------
+    def _build_sidebar(self):
+        side = ttk.Frame(self, width=220)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+
+        ttk.Label(side, text="Scarf's SS Tool", font=("Segoe UI Semibold", 14)
+                  ).pack(anchor="w", padx=16, pady=(18, 0))
+        ttk.Label(side, text=f"Screenshare helper  -  v{VERSION_LABEL}", foreground="gray"
+                  ).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # Bottom first (pack stacks bottom-up): dark-mode switch, then pinned tabs.
+        switch_style = "Switch.TCheckbutton" if sv_ttk else "TCheckbutton"
+        ttk.Checkbutton(side, text="Dark mode", style=switch_style,
+                        variable=self.dark_mode, command=self.toggle_dark_mode
+                        ).pack(side="bottom", anchor="w", padx=16, pady=(8, 16))
+        for title, _ in reversed(TABS):
+            if title in PINNED_BOTTOM:
+                self._add_item(side, title, "bottom")
+        for title, _ in TABS:
+            if title not in PINNED_BOTTOM:
+                self._add_item(side, title, "top")
+
+    def _add_item(self, parent, title, where):
+        item = SidebarItem(parent, title, lambda t=title: self.show_tab(t))
+        item.pack(side=where, fill="x", padx=(8, 8), pady=1)
+        self.items[title] = item
+
+    def _build_main(self):
+        main = ttk.Frame(self)
+        main.pack(side="left", fill="both", expand=True)
+
+        self.page_title = tk.StringVar()
+        ttk.Label(main, textvariable=self.page_title, font=("Segoe UI Semibold", 18)
+                  ).pack(anchor="w", padx=20, pady=(16, 4))
+
+        footer = ttk.Label(
+            main,
+            text=("For use during a screenshare the other person has agreed to. "
+                  "Results are leads to review, not proof of cheating."),
+            foreground="gray", anchor="w", justify="left")
+        footer.pack(side="bottom", fill="x", padx=20, pady=(4, 10))
+        footer.bind("<Configure>", lambda e: footer.configure(wraplength=max(200, e.width)))
+
+        content = ttk.Frame(main)
+        content.pack(fill="both", expand=True, padx=8)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+        for title, tab_class in TABS:
+            tab = tab_class(content)
+            tab.grid(row=0, column=0, sticky="nsew")
+            tab.grid_remove()                      # only the selected page is mapped
+            self.tabs[title] = tab
+
+    # ---- navigation -------------------------------------------------------
+    def show_tab(self, title):
+        if title == self.current:
+            return
+        if self.current:
+            self.tabs[self.current].grid_remove()
+            self.items[self.current].set_selected(False)
+        self.tabs[title].grid()
+        self.items[title].set_selected(True)
+        self.page_title.set(title)
+        self.current = title
+
+    def _step_tab(self, delta):
+        titles = [t for t, _ in TABS]
+        self.show_tab(titles[(titles.index(self.current) + delta) % len(titles)])
+
+    # ---- theming ----------------------------------------------------------
     def toggle_dark_mode(self):
         self._apply_theme(DARK_COLORS if self.dark_mode.get() else LIGHT_COLORS)
 
     def _apply_theme(self, c):
+        self.colors = c
+        dark = c is DARK_COLORS
+        if sv_ttk:
+            sv_ttk.set_theme("dark" if dark else "light")
+        else:
+            self._apply_fallback_theme(c)
+        self.configure(bg=c["bg"])
+        self._recolor_classic_widgets(self, c)
+        for item in self.items.values():
+            item.apply(c)
+        self._set_titlebar_dark(dark)
+
+    def _set_titlebar_dark(self, dark):
+        """Match the Windows title bar to the theme (Win10 1809+ / Win11)."""
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):       # DWMWA_USE_IMMERSIVE_DARK_MODE (new / old id)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                    break
+        except Exception:
+            pass
+
+    def _apply_fallback_theme(self, c):
+        """Used only when sv-ttk could not be installed: plain 'clam' with our colors."""
         s = self.style
         s.theme_use("clam")
         s.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field_bg"])
-        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
-                     "TCheckbutton", "TNotebook"):
+        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label", "TCheckbutton"):
             s.configure(name, background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("TButton", background=c["field_bg"], foreground=c["fg"])
@@ -3806,9 +4032,6 @@ class App(tk.Tk):
                     background=c["field_bg"])
         s.map("TCombobox", fieldbackground=[("readonly", c["field_bg"])],
               foreground=[("readonly", c["fg"])])
-        s.configure("TNotebook.Tab", background=c["field_bg"], foreground=c["fg"])
-        s.map("TNotebook.Tab", background=[("selected", c["select"])],
-              foreground=[("selected", c["select_fg"])])
         s.configure("Treeview", background=c["field_bg"], fieldbackground=c["field_bg"],
                     foreground=c["fg"])
         s.configure("Treeview.Heading", background=c["bg"], foreground=c["fg"])
@@ -3816,16 +4039,15 @@ class App(tk.Tk):
               foreground=[("selected", c["select_fg"])])
         s.configure("Horizontal.TProgressbar", background=c["select"])
 
-        self.configure(bg=c["bg"])
-        self._recolor_classic_widgets(self, c)
-
     def _recolor_classic_widgets(self, widget, c):
         """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas), so walk the
         whole widget tree and recolor those by hand. New tabs get this for free."""
         for child in widget.winfo_children():
             try:
                 if isinstance(child, (tk.Text, tk.Listbox)):
-                    opts = dict(bg=c["field_bg"], fg=c["fg"], highlightthickness=0,
+                    opts = dict(bg=c["field_bg"], fg=c["fg"], relief="flat", borderwidth=0,
+                                highlightthickness=1, highlightbackground=c["border"],
+                                highlightcolor=c["accent"],
                                 selectbackground=c["select"], selectforeground=c["select_fg"])
                     if isinstance(child, tk.Text):       # Listbox has no insertbackground option
                         opts["insertbackground"] = c["fg"]
