@@ -3,9 +3,9 @@ Scarf's SS Tool - Minecraft screenshare helper GUI (Windows)
 
 Tabs:
   - Memory Scan:        scans a running process's memory for keyword strings
-  - DLL Scanner:        lists DLLs loaded into a process
+  - DLL Scanner:        lists DLLs loaded into a process; hashes flagged against signatures.json
   - Log Checker:        usernames seen in logs (possible alts) + launcher accounts
-  - Mods Scanner:       finds mods folders, inspects jars and game versions
+  - Mods Scanner:       finds mods folders, inspects jars (keywords + signature DB) and game versions
   - Versions Audit:     version folders vs. official hashes, JVM args, launcher profiles
   - Servers:            saved servers from servers.dat
   - Recycle Bin:        reads $Recycle.Bin metadata for deleted-file history
@@ -14,6 +14,11 @@ Tabs:
   - Installed Programs: registry uninstall entries, including leftovers
   - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
+
+Signature database: signatures.json (next to this script) holds SHA-256 hashes of
+confirmed cheat files and jar entry-path patterns. Hash matches are exact-file matches,
+so a rebuilt or modified cheat will not match - treat a miss as "unknown", not "clean".
+Edit it by hand, or use "Add selected jar to DB" in the Mods Scanner tab.
 
 Built for VISIBLE use during a screenshare the other person has agreed to.
 Everything here reads artifacts already on disk or live process metadata;
@@ -81,7 +86,7 @@ ensure_dependencies()
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 except ImportError:
     sys.exit("tkinter is missing. Reinstall Python from python.org and make "
              "sure 'tcl/tk and IDLE' is checked.")
@@ -1010,6 +1015,154 @@ def keyword_hits_in(text, matcher):
     return {kw: tier for key, (kw, tier) in matcher if key in blob}
 
 
+# ---------------------------------------------------------------------------
+# Signature database (known-cheat file hashes + jar entry patterns)
+# ---------------------------------------------------------------------------
+# signatures.json lives next to this script and looks like:
+#   {"hashes":       [{"sha256": "<64 hex>", "name": "SomeClient 1.2", "severity": "high",
+#                      "note": "optional"}],
+#    "jar_patterns": [{"pattern": "net/someclient/module/", "name": "SomeClient",
+#                      "severity": "high"}]}
+# severity is "high" (red, default) or "context" (amber). Patterns are matched,
+# case-insensitively and ignoring spaces/_/-, against the entry names inside a jar.
+SIGNATURE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signatures.json")
+SIG_MIN_PATTERN = 6        # shorter patterns would match half the jars out there
+SIG_TEMPLATE = {
+    "_help": ("hashes: exact SHA-256 of confirmed cheat files. jar_patterns: text that "
+              "appears in entry paths inside a cheat jar (min 6 chars). severity is "
+              "'high' or 'context'. Keys starting with _ are ignored."),
+    "hashes": [],
+    "jar_patterns": [],
+}
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _sig_severity(value):
+    return "context" if str(value).strip().lower() == "context" else "high"
+
+
+class SignatureDB:
+    """Loads signatures.json. match_*/lookup_* are safe to call from scan threads:
+    load() swaps in fresh containers rather than mutating the ones in use."""
+
+    def __init__(self, path=SIGNATURE_FILE):
+        self.path = path
+        self.hashes = {}       # sha256 -> (name, severity, note)
+        self.patterns = []     # [(normalised pattern, name, severity, note)]
+        self.status = ""
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("top level must be an object")
+        except FileNotFoundError:
+            self.hashes, self.patterns = {}, []
+            self.status = "Signature DB: signatures.json not found (Open file creates it)"
+            return
+        except (OSError, ValueError) as exc:
+            self.hashes, self.patterns = {}, []
+            self.status = f"Signature DB: couldn't read signatures.json ({exc})"
+            return
+        hashes, patterns, bad = {}, [], 0
+
+        def entries(key):
+            value = data.get(key)
+            return value if isinstance(value, list) else []
+
+        for e in entries("hashes"):
+            digest = str(e.get("sha256", "")).strip().lower() if isinstance(e, dict) else ""
+            if not _SHA256_RE.fullmatch(digest):
+                bad += 1
+                continue
+            hashes[digest] = (str(e.get("name") or "unnamed").strip()[:60],
+                              _sig_severity(e.get("severity")),
+                              str(e.get("note") or "").strip()[:120])
+        for e in entries("jar_patterns"):
+            key = _norm(str(e.get("pattern", ""))) if isinstance(e, dict) else ""
+            if len(key) < SIG_MIN_PATTERN:
+                bad += 1
+                continue
+            patterns.append((key, str(e.get("name") or "unnamed").strip()[:60],
+                             _sig_severity(e.get("severity")),
+                             str(e.get("note") or "").strip()[:120]))
+        self.hashes, self.patterns = hashes, patterns
+        self.status = (f"Signature DB: {len(hashes)} hash(es), {len(patterns)} jar pattern(s)"
+                       + (f", {bad} invalid entr{'y' if bad == 1 else 'ies'} skipped" if bad else ""))
+
+    def lookup_hash(self, digest):
+        """(name, severity, note) for a known SHA-256, else None."""
+        return self.hashes.get((digest or "").lower())
+
+    def match_hash(self, digest):
+        """-> ({flag label: tier}, evidence text); both empty when unknown."""
+        found = self.lookup_hash(digest)
+        if not found:
+            return {}, ""
+        name, sev, note = found
+        return ({f"signature {name}": sev},
+                f"signature DB: SHA-256 matches {name}" + (f" ({note})" if note else ""))
+
+    def match_names(self, names):
+        """names: entry paths inside a jar -> ({flag label: tier}, [evidence, ...])."""
+        patterns = self.patterns
+        if not patterns or not names:
+            return {}, []
+        blob = _norm("\x00".join(names))
+        hits, evidence = {}, []
+        for key, name, sev, _note in patterns:
+            if key not in blob:
+                continue
+            label = f"signature {name}"
+            if SEVERITY_RANK[hits.get(label, "")] >= SEVERITY_RANK[sev]:
+                continue
+            hits[label] = sev
+            sample = next((n for n in names if key in _norm(n)), "")
+            evidence.append(f"signature DB: {name} (jar entry {sample})")
+        return hits, evidence
+
+    def ensure_file(self):
+        """Create an empty signatures.json if there isn't one yet."""
+        if not os.path.exists(self.path):
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(SIG_TEMPLATE, f, indent=2)
+
+    def add_hash(self, digest, name, severity="high", note=""):
+        """Append one confirmed hash to signatures.json. Returns None, or an error message."""
+        digest = (digest or "").strip().lower()
+        if not _SHA256_RE.fullmatch(digest):
+            return "That isn't a SHA-256 hash (the file may have been too large to hash)."
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    return "signatures.json must be a JSON object; fix it by hand first."
+            else:
+                data = json.loads(json.dumps(SIG_TEMPLATE))
+            hashes = data.setdefault("hashes", [])
+            if not isinstance(hashes, list):
+                return "\"hashes\" in signatures.json must be a list; fix it by hand first."
+            if any(isinstance(e, dict) and str(e.get("sha256", "")).lower() == digest
+                   for e in hashes):
+                return "That hash is already in the database."
+            hashes.append({"sha256": digest, "name": name, "severity": _sig_severity(severity),
+                           "note": note, "added": datetime.now().strftime("%Y-%m-%d")})
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.path)
+        except (OSError, ValueError) as exc:
+            return f"Couldn't update signatures.json: {exc}"
+        self.load()
+        return None
+
+
+SIGDB = SignatureDB()
+
+
 _TOML_NAME_RE = re.compile(r"^\s*displayName\s*=\s*[\"']([^\"']+)[\"']", re.M)
 _TOML_ID_RE = re.compile(r"^\s*modId\s*=\s*[\"']([^\"']+)[\"']", re.M)
 
@@ -1091,6 +1244,10 @@ def inspect_jar(path, matcher, extra_text=()):
                 break
         if len(evidence) >= 3:
             break
+    sig_hits, sig_evidence = SIGDB.match_names(names)    # known-cheat entry paths
+    if sig_hits:
+        hits.update(sig_hits)
+        evidence = sig_evidence[:2] + evidence
     result["evidence"] = "; ".join(evidence)
     return result
 
@@ -1114,12 +1271,18 @@ def describe_jar(path, shown_name, matcher, kind="mod", hash_cap=HASH_SIZE_CAP, 
     except OSError:
         return None
     info = inspect_jar(path, matcher, extra_text)
+    digest = _sha256_of(path, st.st_size, hash_cap)
+    hits, evidence = dict(info["hits"]), info["evidence"]
+    hash_hits, hash_evidence = SIGDB.match_hash(digest)      # exact known-cheat file
+    if hash_hits:
+        hits.update(hash_hits)
+        evidence = "; ".join(filter(None, [hash_evidence, evidence]))
     return {"kind": kind, "file": shown_name, "path": path, "size": st.st_size,
             "modified": datetime.fromtimestamp(st.st_mtime),
-            "sha256": _sha256_of(path, st.st_size, hash_cap),
+            "sha256": digest,
             "info": info["info"] or info["note"],
-            "flags": format_flags(info["hits"]), "severity": worst_tier(info["hits"]),
-            "evidence": info["evidence"]}
+            "flags": format_flags(hits), "severity": worst_tier(hits),
+            "evidence": evidence}
 
 
 def profile_label_for(found_dir, root):
@@ -2143,6 +2306,34 @@ def shared_keyword_tiers(widget):
     return tiers
 
 
+def signature_bar(parent):
+    """One-line status of the signature DB with Reload / Open file buttons.
+    The returned frame has a .refresh() method to update the label."""
+    bar = ttk.Frame(parent)
+    status = tk.StringVar(value=SIGDB.status)
+
+    def refresh():
+        status.set(SIGDB.status)
+
+    def reload():
+        SIGDB.load()
+        refresh()
+
+    def open_file():
+        try:
+            SIGDB.ensure_file()
+            os.startfile(SIGDB.path)
+        except OSError as exc:
+            messagebox.showerror("Signature DB", f"Couldn't open {SIGDB.path}\n{exc}")
+        refresh()
+
+    ttk.Label(bar, textvariable=status).pack(side="left")
+    ttk.Button(bar, text="Reload", command=reload).pack(side="left", padx=(8, 0))
+    ttk.Button(bar, text="Open file", command=open_file).pack(side="left", padx=4)
+    bar.refresh = refresh
+    return bar
+
+
 # ---------------------------------------------------------------------------
 # Reusable widgets
 # ---------------------------------------------------------------------------
@@ -2909,19 +3100,23 @@ class DLLScannerTab(ScanTab):
             "catches cheats injected as a module rather than run as their own "
             "visible program. \"Location\" just tells you whether the file sits "
             "under Windows' system folder or the game's own folder; anything "
-            "else is worth a closer look, not automatic proof of anything.")
-    COLUMNS = (("name", "Module", 220), ("location", "Location", 110),
-               ("base", "Base address", 140), ("size", "Size (bytes)", 90),
-               ("path", "Full path", 440))
+            "else is worth a closer look, not automatic proof of anything. Modules "
+            "outside the Windows folder are also SHA-256 hashed and checked against "
+            "signatures.json; an exact match is shown in red.")
+    COLUMNS = (("name", "Module", 200), ("location", "Location", 100),
+               ("signature", "Signature match", 170), ("base", "Base address", 140),
+               ("size", "Size (bytes)", 90), ("path", "Full path", 400))
     STRETCH = "path"
-    SEARCH_KEYS = ("name", "path", "location")
-    EXPORT_HEADER = ["module", "location", "base_address", "size_bytes", "path"]
+    SEARCH_KEYS = ("name", "path", "location", "signature")
+    EXPORT_HEADER = ["module", "location", "signature_match", "base_address", "size_bytes",
+                     "sha256", "path"]
     SCAN_LABEL = "Scan loaded modules"
-    THREADED = False        # a module snapshot is near-instant
+    THREADED = True         # hashing the non-system modules takes a moment
 
     def build_top(self):
         self.procs = ProcessPicker(self, status_cb=self.set_status, show_admin=True)
         self.procs.pack(fill="x", pady=(8, 0))
+        signature_bar(self).pack(fill="x", pady=(6, 0))
 
     def after_build(self):
         self.procs.refresh()
@@ -2950,17 +3145,38 @@ class DLLScannerTab(ScanTab):
                 location = "game folder"
             else:
                 location = "other"
-            rows.append({**m, "location": location})
+            digest, signature, severity = "", "", ""
+            if location != "system":
+                try:
+                    digest = _sha256_of(m["path"], os.path.getsize(m["path"]), VERSION_HASH_CAP)
+                except OSError:
+                    digest = ""
+                known = SIGDB.lookup_hash(digest)
+                if known:
+                    name, severity, note = known
+                    signature = name + (f" ({note})" if note else "")
+            if digest.startswith("("):          # "(too large to hash)" isn't a hash
+                digest = ""
+            rows.append({**m, "location": location, "signature": signature,
+                         "severity": severity, "sha256": digest})
+        rows.sort(key=lambda r: -SEVERITY_RANK[r["severity"]])    # stable: matches float up
         return rows
 
     def done_message(self, rows):
-        return f"PID {self.scanned_pid}: {len(rows)} loaded module(s)."
+        hits = sum(1 for r in rows if r["signature"])
+        extra = f"; {hits} matched the signature DB" if hits else ""
+        return f"PID {self.scanned_pid}: {len(rows)} loaded module(s){extra}."
+
+    def row_tags(self, m):
+        return (m["severity"],) if m["severity"] else ()
 
     def row_values(self, m):
-        return (m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"])
+        return (m["name"], m["location"], m["signature"], f"0x{m['base']:016X}", m["size"],
+                m["path"])
 
     def export_row(self, m):
-        return list(self.row_values(m))
+        return [m["name"], m["location"], m["signature"], f"0x{m['base']:016X}", m["size"],
+                m["sha256"], m["path"]]
 
 
 # ---------------------------------------------------------------------------
@@ -3058,7 +3274,10 @@ class ModsScannerTab(AuditTab):
             "its class/package/resource names, file name and declared mod name are checked "
             "against the Memory Scan keyword list, so a renamed cheat is still caught. Red = "
             "distinctive cheat name, amber = common word (check the evidence in the box below). "
-            "Hashes are skipped for mods over 20 MB (64 MB for game versions).")
+            "Hashes are skipped for mods over 20 MB (64 MB for game versions). Each jar is also "
+            "checked against signatures.json: an exact SHA-256 match or a known cheat entry path "
+            "shows as \"HIGH: signature <name>\". A hash only matches an unmodified copy of "
+            "the file, so no match does not mean the jar is clean.")
     COLUMNS = (("flags", "Flags", 150), ("file", "File / version", 190),
                ("info", "Declared name / info", 150), ("kind", "Kind", 55),
                ("launcher", "Launcher", 100), ("profile", "Profile/instance", 110),
@@ -3087,6 +3306,39 @@ class ModsScannerTab(AuditTab):
                   ).pack(side="left")
         self.extra_kw = tk.StringVar()
         ttk.Entry(row, textvariable=self.extra_kw, width=40).pack(side="left", padx=6)
+        self.sig_bar = signature_bar(opt)
+        self.sig_bar.pack(fill="x", pady=(4, 0))
+        ttk.Button(self.sig_bar, text="Add selected jar to DB...",
+                   command=self.add_selected_to_db).pack(side="left", padx=4)
+
+    def add_selected_to_db(self):
+        sel = self.tree.selection()
+        visible = self.visible_rows()
+        idx = self.tree.index(sel[0]) if sel else -1
+        if not 0 <= idx < len(visible):
+            messagebox.showinfo("Add to signature DB", "Select a row in the table first.")
+            return
+        row = visible[idx]
+        if not _SHA256_RE.fullmatch(row["sha256"] or ""):
+            messagebox.showwarning("Add to signature DB",
+                                   "This row has no SHA-256 (no jar, or too large to hash).")
+            return
+        if not messagebox.askyesno(
+                "Add to signature DB",
+                f"Only add files you have confirmed are cheats - a wrong entry will flag "
+                f"innocent players later.\n\nAdd {row['file']} to signatures.json?"):
+            return
+        name = simpledialog.askstring("Add to signature DB", "Name of the cheat/client:",
+                                      parent=self)
+        if not name or not name.strip():
+            return
+        err = SIGDB.add_hash(row["sha256"], name.strip(), "high", f"seen as {row['file']}")
+        self.sig_bar.refresh()
+        if err:
+            messagebox.showwarning("Add to signature DB", err)
+        else:
+            messagebox.showinfo("Add to signature DB",
+                                f"Added {name.strip()}. It will be flagged on the next scan.")
 
     def keyword_tiers(self):
         """The shared keyword list plus this scan's extra keywords."""
@@ -3105,8 +3357,10 @@ class ModsScannerTab(AuditTab):
 
     def done_message(self, rows):
         mods = sum(1 for r in rows if r["kind"] == "mod")
+        sigs = sum(1 for r in rows if "signature " in r["flags"])
+        sig_note = f"; {sigs} known-signature match(es)" if sigs else ""
         return (f"Found {mods} mod jar(s) and {len(rows) - mods} game version(s); "
-                f"{self.flag_summary(rows)}.")
+                f"{self.flag_summary(rows)}{sig_note}.")
 
     def row_values(self, m):
         return (m["flags"], m["file"], m["info"], m["kind"], m["launcher"], m["profile"],
