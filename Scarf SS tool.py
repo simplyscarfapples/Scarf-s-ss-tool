@@ -32,6 +32,13 @@ import sys
 if sys.platform != "win32":
     sys.exit("This tool only works on Windows.")
 
+# Version info. build.py reads and bumps these (python build.py --bump).
+APP_NAME = "Scarf's SS Tool"
+APP_VERSION = "1.4"
+APP_STAGE = ""           # "Beta", or "" for a stable release
+VERSION_LABEL = f"{APP_VERSION} {APP_STAGE}".strip()
+FROZEN = getattr(sys, "frozen", False)      # True when running as the built .exe
+
 import csv
 import ctypes
 import ctypes.wintypes as wt
@@ -45,12 +52,17 @@ import re
 import string
 import struct
 import subprocess
+import tempfile
 import threading
 import winreg
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+# Folder next to the script, or next to the .exe when built (a one-file exe's
+# __file__ points at a temp folder that is deleted on exit).
+APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
@@ -59,6 +71,8 @@ REQUIRED = {"psutil": "psutil", "sv_ttk": "sv-ttk"}  # import name -> pip packag
 
 
 def ensure_dependencies():
+    if FROZEN:      # the exe already bundles everything; pip would re-launch the exe
+        return
     missing = []
     for module, package in REQUIRED.items():
         try:
@@ -220,7 +234,7 @@ def is_admin():
 def relaunch_as_admin():
     """Ask Windows to restart this script elevated. Returns False if the user
     declined the UAC prompt (ShellExecute returns <= 32 on failure)."""
-    args = [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    args = sys.argv[1:] if FROZEN else [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
     params = " ".join(f'"{a}"' for a in args)
     return ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1) > 32
 
@@ -346,6 +360,9 @@ def read_chunk(handle, base, size, buf=None):
 # only then grow each hit into the full string around it. Measured ~4x faster
 # with identical results. Used only when "save all strings" is off.
 MAX_CONTEXT = 2000        # how far to look left/right of a hit for the string's edges
+CHUNK_OVERLAP = 4096      # extra bytes read either side of a chunk so strings that straddle
+                          # a chunk boundary are seen whole (must be > MAX_CONTEXT)
+IS_32BIT_PYTHON = ctypes.sizeof(ctypes.c_void_p) == 4
 
 
 def build_fast_matchers(keywords):
@@ -413,8 +430,16 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
 
     try:
         regions = list(iter_regions(handle))
+        if not regions:
+            hint = (" This is 32-bit Python, which can't read a 64-bit game - install 64-bit "
+                    "Python or use the 64-bit exe." if IS_32BIT_PYTHON else
+                    " Try 'Run as admin', or the process may have just exited.")
+            q.put(("status", f"No readable memory found in PID {pid}.{hint}"))
+            return total_strings, hits
         total_bytes = sum(s for _, s in regions) or 1
-        buf = ctypes.create_string_buffer(min(max_chunk, max((s for _, s in regions), default=1)))
+        # Each read is a chunk plus overlap on both sides, never more than its region.
+        buf = ctypes.create_string_buffer(
+            min(max_chunk + 2 * CHUNK_OVERLAP, max(s for _, s in regions)))
         done_bytes = 0
         for base, size in regions:
             offset = 0
@@ -422,8 +447,13 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                 if stop.is_set():
                     return total_strings, hits
                 n = min(max_chunk, size - offset)
-                data = read_chunk(handle, base + offset, n, buf)
-                chunk_base = base + offset
+                # Read a little before and after the chunk so a string (or keyword) that
+                # straddles a boundary is found whole. Only strings that START inside the
+                # chunk proper are kept below, so nothing is reported twice.
+                lead = min(CHUNK_OVERLAP, offset)
+                tail = min(CHUNK_OVERLAP, size - offset - n)
+                chunk_base = base + offset - lead
+                data = read_chunk(handle, chunk_base, lead + n + tail, buf)
                 offset += n
                 done_bytes += n
                 if not data:
@@ -436,6 +466,8 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                     found += [(m.start(), m.group().decode("utf-16le"), "utf16")
                               for m in utf16_re.finditer(data)]
                 for off, text, enc in found:
+                    if off < lead or off >= lead + n:
+                        continue                  # belongs to the neighbouring chunk
                     if total_strings is not None:
                         total_strings += 1
                     addr = chunk_base + off
@@ -443,7 +475,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                         h = hash(text)
                         if h not in seen_all:
                             seen_all.add(h)
-                            dump_file.write(f"0x{addr:016X}\t{enc}\t{text}\n")
+                            dump_file.write(f"0x{addr:016X}\t{enc}\t{redact_secrets(text)}\n")
                     m = kw_regex.search(text) if kw_regex else None
                     if m:
                         kw = m.group(0).lower()
@@ -453,7 +485,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                         seen_hits.add(key)
                         hits += 1
                         q.put(("hit", (datetime.now().strftime("%H:%M:%S"), pid,
-                                       f"0x{addr:016X}", enc, kw, text)))
+                                       f"0x{addr:016X}", enc, kw, redact_secrets(text))))
                 q.put(("progress", done_bytes * 100 / total_bytes))
     finally:
         kernel32.CloseHandle(handle)
@@ -1244,10 +1276,40 @@ _SUSPICIOUS_LOWER = tuple(a.lower() for a in SUSPICIOUS_JVM_ARGS)
 # displayed or exported: anything that looks like one is replaced before it is shown.
 _SECRET_ARG_RE = re.compile(
     r"(--(?:accessToken|session|xuid|clientId|userProperties)(?:=|\s+))\S+", re.I)
+# Older game versions log "Session ID is token:<token>:<uuid>"; JWT-shaped values are
+# caught too, wherever they turn up (memory strings, crash reports, logs).
+_TOKEN_RE = re.compile(r"(token:)[\w.\-]+|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}", re.I)
 
 
 def redact_secrets(text):
-    return _SECRET_ARG_RE.sub(r"\1<hidden>", text)
+    text = _SECRET_ARG_RE.sub(r"\1<hidden>", text)
+    return _TOKEN_RE.sub(lambda m: (m.group(1) or "") + "<hidden>", text)
+
+
+def csv_safe(value):
+    """Stop spreadsheet apps from running text taken from the inspected PC as a
+    formula (cells starting with = + - @)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def get_log_dir():
+    """APP_DIR/logs if it can be written to, else a folder in the temp directory
+    (the tool may be run from a read-only location or a locked-down USB stick).
+    Returns None if neither works."""
+    for base, name in ((APP_DIR, "logs"), (tempfile.gettempdir(), "ScarfSSTool_logs")):
+        path = os.path.join(base, name)
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write_test")   # os.access() is unreliable on Windows
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return path
+        except OSError:
+            continue
+    return None
 
 
 def find_suspicious_jvm_args(args):
@@ -2515,6 +2577,39 @@ class ScanTab(TableTab):
     def init_state(self):
         self.worker = None
         self.stop_event = threading.Event()
+        # Worker threads never touch Tk directly: they queue callables here and the
+        # UI thread runs them (see _drain_ui). Calling after() from another thread can
+        # raise "main thread is not in main loop" and leave the Scan button disabled.
+        self._ui_q = queue.SimpleQueue()
+        self._progress_pct = None
+        self.after(100, self._drain_ui)
+
+    def _post(self, fn):
+        """Run fn on the UI thread (immediately, if we're already on it)."""
+        if self.THREADED:
+            self._ui_q.put(fn)
+        else:
+            fn()
+
+    def _drain_ui(self):
+        try:
+            while True:
+                try:
+                    fn = self._ui_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn()
+                except tk.TclError:
+                    pass                      # widget already destroyed
+                except Exception as exc:      # keep draining; never strand the Scan button
+                    self.set_status(f"Internal error: {exc}")
+            pct, self._progress_pct = self._progress_pct, None
+            if pct is not None and self.HAS_PROGRESS:
+                self.progress.configure(value=pct)
+        except tk.TclError:
+            return                            # tab destroyed - stop polling
+        self.after(100, self._drain_ui)
 
     # ---- hooks ------------------------------------------------------------
     def prepare_scan(self):
@@ -2545,8 +2640,8 @@ class ScanTab(TableTab):
             self.progress.pack(side="right")
 
     def report_progress(self, pct):
-        """Safe to call from the worker thread."""
-        self.after(0, lambda: self.progress.configure(value=pct))
+        """Safe to call from the worker thread (the UI thread applies the latest value)."""
+        self._progress_pct = pct
 
     # ---- running a scan ---------------------------------------------------
     def start_scan(self):
@@ -2560,28 +2655,41 @@ class ScanTab(TableTab):
             self.progress["value"] = 0
         self.scan_btn.config(state="disabled")
         self.set_status(self.BUSY_TEXT)
-        if self.THREADED:
-            self.worker = threading.Thread(target=self._run, args=args, daemon=True)
-            self.worker.start()
-        else:
-            self._run(*args)
+        try:
+            if self.THREADED:
+                self.worker = threading.Thread(target=self._run, args=args, daemon=True)
+                self.worker.start()
+            else:
+                self._run(*args)
+        except Exception as exc:              # e.g. the thread couldn't be started
+            self.scan_btn.config(state="normal")
+            self.set_status(f"Could not start the scan: {exc}")
 
     def _run(self, *args):
+        rows, error = [], None
         try:
             rows = self.scan(*args)
-        except Exception as exc:
-            rows, msg = [], str(exc)
-            self.after(0, lambda: messagebox.showerror(self.ERROR_TITLE, msg))
-        if self.THREADED:
-            self.after(0, lambda: self._finish(rows))
-        else:
-            self._finish(rows)
+        except BaseException as exc:          # whatever happens, _finish must still run
+            error = str(exc) or exc.__class__.__name__
+        finally:
+            self._post(lambda: self._finish(rows, error))
 
-    def _finish(self, rows):
-        self.on_scan_done(rows)
-        self.set_rows(rows)
-        self.scan_btn.config(state="normal")
-        self.set_status(self.done_message(rows))
+    def _finish(self, rows, error=None):
+        """Always runs on the UI thread and always re-enables the Scan button."""
+        problem = error
+        try:
+            if error is None:
+                self.on_scan_done(rows)
+                self.set_rows(rows)
+        except Exception as exc:              # a bad row / widget error in post-processing
+            problem = f"{exc.__class__.__name__}: {exc}"
+        finally:
+            self.scan_btn.config(state="normal")
+        if problem is not None:
+            self.set_status(f"{self.ERROR_TITLE}: {problem}")
+            messagebox.showerror(self.ERROR_TITLE, problem)
+        else:
+            self.set_status(self.done_message(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -2754,16 +2862,24 @@ class MemoryScanTab(TableTab):
     def load_keywords(self):
         path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All", "*.*")])
         if path:
-            with open(path, "r", encoding="utf-8") as f:
-                self.kw_text.delete("1.0", "end")
-                self.kw_text.insert("1.0", f.read())
+            try:
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                    text = f.read()
+            except OSError as exc:
+                messagebox.showerror("Load keywords", f"Could not read that file:\n{exc}")
+                return
+            self.kw_text.delete("1.0", "end")
+            self.kw_text.insert("1.0", text)
 
     def save_keywords(self):
         path = filedialog.asksaveasfilename(defaultextension=".txt",
                                             filetypes=[("Text files", "*.txt")])
         if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(keyword_lines(self.get_keywords())))
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(keyword_lines(self.get_keywords())))
+            except OSError as exc:
+                messagebox.showerror("Save keywords", f"Could not save that file:\n{exc}")
 
     def reset_keywords(self):
         self.kw_text.delete("1.0", "end")
@@ -2812,13 +2928,16 @@ class MemoryScanTab(TableTab):
 
     def _worker(self, pids, kw_regex, min_len, dump_all):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = get_log_dir()
         dump_file = None
-        if dump_all:
-            dump_file = open(os.path.join(log_dir, f"allstrings_{stamp}.txt"), "w", encoding="utf-8")
         summary = []
         try:
+            if dump_all:
+                if log_dir:
+                    dump_file = open(os.path.join(log_dir, f"allstrings_{stamp}.txt"), "w",
+                                     encoding="utf-8")
+                else:
+                    summary.append("no writable folder for the all-strings dump (skipped)")
             for pid in pids:
                 if self.stop_event.is_set():
                     break
@@ -2830,46 +2949,57 @@ class MemoryScanTab(TableTab):
         except Exception as exc:
             summary.append(f"Error: {exc}")
         finally:
+            # Always tell the UI we're finished, even if setup or a scan failed -
+            # otherwise the Start button would stay disabled forever.
             if dump_file:
                 dump_file.close()
-        self.q.put(("done", " | ".join(summary), stamp, log_dir))
+            self.q.put(("done", " | ".join(summary), stamp, log_dir))
 
     def _poll_queue(self):
         """Drain the worker's queue on the UI thread. Hits are inserted in one batch
         per poll, and the progress bar / status are only touched once each."""
-        progress = status = done = None
-        f = self.current_filter()
         try:
-            while True:
-                msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "hit":
-                    self.rows.append(msg[1])
-                    if self.is_visible(msg[1], f):
-                        self.insert_row(msg[1])
-                elif kind == "progress":
-                    progress = msg[1]
-                elif kind == "status":
-                    status = msg[1]
-                elif kind == "done":
-                    done = msg
-        except queue.Empty:
-            pass
-        if progress is not None:
-            self.progress["value"] = progress
-        if status is not None:
-            self.set_status(status)
-        if done is not None:
-            self._on_done(*done[1:])
-        self.after(100, self._poll_queue)
+            progress = status = done = None
+            f = self.current_filter()
+            try:
+                while True:
+                    msg = self.q.get_nowait()
+                    kind = msg[0]
+                    if kind == "hit":
+                        self.rows.append(msg[1])
+                        if self.is_visible(msg[1], f):
+                            self.insert_row(msg[1])
+                    elif kind == "progress":
+                        progress = msg[1]
+                    elif kind == "status":
+                        status = msg[1]
+                    elif kind == "done":
+                        done = msg
+            except queue.Empty:
+                pass
+            if progress is not None:
+                self.progress["value"] = progress
+            if status is not None:
+                self.set_status(status)
+            if done is not None:
+                self._on_done(*done[1:])
+        finally:
+            # Reschedule no matter what, so one error can't freeze the tab for good.
+            self.after(100, self._poll_queue)
 
     def _on_done(self, summary, stamp, log_dir):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
-        log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
-        self._write_log(log_path)
+        saved = "Log not saved (no writable folder)."
+        if log_dir:
+            log_path = os.path.join(log_dir, f"ss_log_{stamp}.txt")
+            try:
+                self._write_log(log_path)
+                saved = f"Log saved: {log_path}"
+            except OSError as exc:
+                saved = f"Log not saved ({exc})."
         state = "Stopped" if self.stop_event.is_set() else "Done"
-        self.set_status(f"{state}. {summary or 'No data.'}  Log saved: {log_path}")
+        self.set_status(f"{state}. {summary or 'No data.'}  {saved}")
 
     # ---- clear, export -----------------------------------------------------
     def clear_results(self):
@@ -2882,7 +3012,7 @@ class MemoryScanTab(TableTab):
             if path.lower().endswith(".csv"):
                 w = csv.writer(f)
                 w.writerow(self.EXPORT_HEADER + ["level"])
-                w.writerows(list(r) + [self._tier(r[4])] for r in self.rows)
+                w.writerows([csv_safe(c) for c in r] + [self._tier(r[4])] for r in self.rows)
             else:
                 f.write(f"# SS string log - {datetime.now().isoformat()}\n")
                 f.write("# Matches are leads to review, not proof of cheating.\n")
@@ -2897,7 +3027,11 @@ class MemoryScanTab(TableTab):
         path = filedialog.asksaveasfilename(
             defaultextension=".txt", filetypes=[("Text log", "*.txt"), ("CSV", "*.csv")])
         if path:
-            self._write_log(path)
+            try:
+                self._write_log(path)
+            except OSError as exc:
+                messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+                return
             self.set_status(f"Exported {len(self.rows)} rows to {path}")
 
 
@@ -3717,7 +3851,7 @@ class CreditsTab(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent, padding=24)
-        ttk.Label(self, text="Scarf's SS Tool 1.0", font=("Segoe UI", 18, "bold")
+        ttk.Label(self, text=f"{APP_NAME} {VERSION_LABEL}", font=("Segoe UI", 18, "bold")
                   ).pack(pady=(16, 4))
         ttk.Label(self, text="Credits", font=("Segoe UI", 13, "bold")).pack(pady=(24, 10))
         for name in self.NAMES:
@@ -3800,7 +3934,7 @@ class SidebarItem(tk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Scarf's SS Tool 1.0")
+        self.title(f"{APP_NAME} {VERSION_LABEL}")
         self.geometry("1200x780")
         self.minsize(1000, 640)
 
@@ -3834,9 +3968,9 @@ class App(tk.Tk):
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
 
-        ttk.Label(side, text="Scarf's SS Tool", font=("Segoe UI Semibold", 14)
+        ttk.Label(side, text=APP_NAME, font=("Segoe UI Semibold", 14)
                   ).pack(anchor="w", padx=16, pady=(18, 0))
-        ttk.Label(side, text="Screenshare helper", foreground="gray"
+        ttk.Label(side, text=f"Screenshare helper \u00b7 {VERSION_LABEL}", foreground="gray"
                   ).pack(anchor="w", padx=16, pady=(0, 14))
 
         # Bottom first (pack stacks bottom-up): dark-mode switch, then pinned tabs.
