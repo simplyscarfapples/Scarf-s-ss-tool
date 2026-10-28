@@ -3,9 +3,10 @@ Scarf's SS Tool - Minecraft screenshare helper GUI (Windows)
 
 Tabs:
   - Memory Scan:        scans a running process's memory for keyword strings
-  - DLL Scanner:        lists DLLs loaded into a process
+  - DLL Scanner:        lists DLLs loaded into a process; hashes flagged against signatures.json
   - Log Checker:        usernames seen in logs (possible alts) + launcher accounts
-  - Mods Scanner:       finds mods folders, inspects jars and game versions
+  - Mods Scanner:       finds mods folders, inspects jars (keywords + signature DB) and game versions
+  - Jar Inspector:      one file: SHA-256, last modified, and add it to signatures.json as a marked cheat
   - Versions Audit:     version folders vs. official hashes, JVM args, launcher profiles
   - Servers:            saved servers from servers.dat
   - Recycle Bin:        reads $Recycle.Bin metadata for deleted-file history
@@ -14,6 +15,11 @@ Tabs:
   - Installed Programs: registry uninstall entries, including leftovers
   - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
+
+Signature database: signatures.json (next to this script) holds SHA-256 hashes of
+confirmed cheat files and jar entry-path patterns. Hash matches are exact-file matches,
+so a rebuilt or modified cheat will not match - treat a miss as "unknown", not "clean".
+Edit it by hand, or use "Add selected jar to DB" in the Mods Scanner tab.
 
 Built for VISIBLE use during a screenshare the other person has agreed to.
 Everything here reads artifacts already on disk or live process metadata;
@@ -34,8 +40,8 @@ if sys.platform != "win32":
 
 # Version info. build.py reads and bumps these (python build.py --bump).
 APP_NAME = "Scarf's SS Tool"
-APP_VERSION = "1.4"
-APP_STAGE = ""           # "Beta", or "" for a stable release
+APP_VERSION = "2.3.2"
+APP_STAGE = "Beta"           # "Beta", or "" for a stable release
 VERSION_LABEL = f"{APP_VERSION} {APP_STAGE}".strip()
 FROZEN = getattr(sys, "frozen", False)      # True when running as the built .exe
 
@@ -67,7 +73,7 @@ APP_DIR = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__
 # ---------------------------------------------------------------------------
 # Dependency bootstrap
 # ---------------------------------------------------------------------------
-REQUIRED = {"psutil": "psutil"}  # import name -> pip package name
+REQUIRED = {"psutil": "psutil", "sv_ttk": "sv-ttk"}  # import name -> pip package name
 
 
 def ensure_dependencies():
@@ -95,7 +101,7 @@ ensure_dependencies()
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 except ImportError:
     sys.exit("tkinter is missing. Reinstall Python from python.org and make "
              "sure 'tcl/tk and IDLE' is checked.")
@@ -104,6 +110,11 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+try:
+    import sv_ttk          # Sun Valley theme: Windows 11 look for plain ttk widgets
+except ImportError:
+    sv_ttk = None          # falls back to the built-in "clam" theme
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -1037,6 +1048,154 @@ def keyword_hits_in(text, matcher):
     return {kw: tier for key, (kw, tier) in matcher if key in blob}
 
 
+# ---------------------------------------------------------------------------
+# Signature database (known-cheat file hashes + jar entry patterns)
+# ---------------------------------------------------------------------------
+# signatures.json lives next to this script and looks like:
+#   {"hashes":       [{"sha256": "<64 hex>", "name": "SomeClient 1.2", "severity": "high",
+#                      "note": "optional"}],
+#    "jar_patterns": [{"pattern": "net/someclient/module/", "name": "SomeClient",
+#                      "severity": "high"}]}
+# severity is "high" (red, default) or "context" (amber). Patterns are matched,
+# case-insensitively and ignoring spaces/_/-, against the entry names inside a jar.
+SIGNATURE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signatures.json")
+SIG_MIN_PATTERN = 6        # shorter patterns would match half the jars out there
+SIG_TEMPLATE = {
+    "_help": ("hashes: exact SHA-256 of confirmed cheat files. jar_patterns: text that "
+              "appears in entry paths inside a cheat jar (min 6 chars). severity is "
+              "'high' or 'context'. Keys starting with _ are ignored."),
+    "hashes": [],
+    "jar_patterns": [],
+}
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _sig_severity(value):
+    return "context" if str(value).strip().lower() == "context" else "high"
+
+
+class SignatureDB:
+    """Loads signatures.json. match_*/lookup_* are safe to call from scan threads:
+    load() swaps in fresh containers rather than mutating the ones in use."""
+
+    def __init__(self, path=SIGNATURE_FILE):
+        self.path = path
+        self.hashes = {}       # sha256 -> (name, severity, note)
+        self.patterns = []     # [(normalised pattern, name, severity, note)]
+        self.status = ""
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("top level must be an object")
+        except FileNotFoundError:
+            self.hashes, self.patterns = {}, []
+            self.status = "Signature DB: signatures.json not found (Open file creates it)"
+            return
+        except (OSError, ValueError) as exc:
+            self.hashes, self.patterns = {}, []
+            self.status = f"Signature DB: couldn't read signatures.json ({exc})"
+            return
+        hashes, patterns, bad = {}, [], 0
+
+        def entries(key):
+            value = data.get(key)
+            return value if isinstance(value, list) else []
+
+        for e in entries("hashes"):
+            digest = str(e.get("sha256", "")).strip().lower() if isinstance(e, dict) else ""
+            if not _SHA256_RE.fullmatch(digest):
+                bad += 1
+                continue
+            hashes[digest] = (str(e.get("name") or "unnamed").strip()[:60],
+                              _sig_severity(e.get("severity")),
+                              str(e.get("note") or "").strip()[:120])
+        for e in entries("jar_patterns"):
+            key = _norm(str(e.get("pattern", ""))) if isinstance(e, dict) else ""
+            if len(key) < SIG_MIN_PATTERN:
+                bad += 1
+                continue
+            patterns.append((key, str(e.get("name") or "unnamed").strip()[:60],
+                             _sig_severity(e.get("severity")),
+                             str(e.get("note") or "").strip()[:120]))
+        self.hashes, self.patterns = hashes, patterns
+        self.status = (f"Signature DB: {len(hashes)} hash(es), {len(patterns)} jar pattern(s)"
+                       + (f", {bad} invalid entr{'y' if bad == 1 else 'ies'} skipped" if bad else ""))
+
+    def lookup_hash(self, digest):
+        """(name, severity, note) for a known SHA-256, else None."""
+        return self.hashes.get((digest or "").lower())
+
+    def match_hash(self, digest):
+        """-> ({flag label: tier}, evidence text); both empty when unknown."""
+        found = self.lookup_hash(digest)
+        if not found:
+            return {}, ""
+        name, sev, note = found
+        return ({f"signature {name}": sev},
+                f"signature DB: SHA-256 matches {name}" + (f" ({note})" if note else ""))
+
+    def match_names(self, names):
+        """names: entry paths inside a jar -> ({flag label: tier}, [evidence, ...])."""
+        patterns = self.patterns
+        if not patterns or not names:
+            return {}, []
+        blob = _norm("\x00".join(names))
+        hits, evidence = {}, []
+        for key, name, sev, _note in patterns:
+            if key not in blob:
+                continue
+            label = f"signature {name}"
+            if SEVERITY_RANK[hits.get(label, "")] >= SEVERITY_RANK[sev]:
+                continue
+            hits[label] = sev
+            sample = next((n for n in names if key in _norm(n)), "")
+            evidence.append(f"signature DB: {name} (jar entry {sample})")
+        return hits, evidence
+
+    def ensure_file(self):
+        """Create an empty signatures.json if there isn't one yet."""
+        if not os.path.exists(self.path):
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(SIG_TEMPLATE, f, indent=2)
+
+    def add_hash(self, digest, name, severity="high", note=""):
+        """Append one confirmed hash to signatures.json. Returns None, or an error message."""
+        digest = (digest or "").strip().lower()
+        if not _SHA256_RE.fullmatch(digest):
+            return "That isn't a SHA-256 hash (the file may have been too large to hash)."
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    return "signatures.json must be a JSON object; fix it by hand first."
+            else:
+                data = json.loads(json.dumps(SIG_TEMPLATE))
+            hashes = data.setdefault("hashes", [])
+            if not isinstance(hashes, list):
+                return "\"hashes\" in signatures.json must be a list; fix it by hand first."
+            if any(isinstance(e, dict) and str(e.get("sha256", "")).lower() == digest
+                   for e in hashes):
+                return "That hash is already in the database."
+            hashes.append({"sha256": digest, "name": name, "severity": _sig_severity(severity),
+                           "note": note, "added": datetime.now().strftime("%Y-%m-%d")})
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self.path)
+        except (OSError, ValueError) as exc:
+            return f"Couldn't update signatures.json: {exc}"
+        self.load()
+        return None
+
+
+SIGDB = SignatureDB()
+
+
 _TOML_NAME_RE = re.compile(r"^\s*displayName\s*=\s*[\"']([^\"']+)[\"']", re.M)
 _TOML_ID_RE = re.compile(r"^\s*modId\s*=\s*[\"']([^\"']+)[\"']", re.M)
 
@@ -1118,6 +1277,10 @@ def inspect_jar(path, matcher, extra_text=()):
                 break
         if len(evidence) >= 3:
             break
+    sig_hits, sig_evidence = SIGDB.match_names(names)    # known-cheat entry paths
+    if sig_hits:
+        hits.update(sig_hits)
+        evidence = sig_evidence[:2] + evidence
     result["evidence"] = "; ".join(evidence)
     return result
 
@@ -1141,12 +1304,18 @@ def describe_jar(path, shown_name, matcher, kind="mod", hash_cap=HASH_SIZE_CAP, 
     except OSError:
         return None
     info = inspect_jar(path, matcher, extra_text)
+    digest = _sha256_of(path, st.st_size, hash_cap)
+    hits, evidence = dict(info["hits"]), info["evidence"]
+    hash_hits, hash_evidence = SIGDB.match_hash(digest)      # exact known-cheat file
+    if hash_hits:
+        hits.update(hash_hits)
+        evidence = "; ".join(filter(None, [hash_evidence, evidence]))
     return {"kind": kind, "file": shown_name, "path": path, "size": st.st_size,
             "modified": datetime.fromtimestamp(st.st_mtime),
-            "sha256": _sha256_of(path, st.st_size, hash_cap),
+            "sha256": digest,
             "info": info["info"] or info["note"],
-            "flags": format_flags(info["hits"]), "severity": worst_tier(info["hits"]),
-            "evidence": info["evidence"]}
+            "flags": format_flags(hits), "severity": worst_tier(hits),
+            "evidence": evidence}
 
 
 def profile_label_for(found_dir, root):
@@ -2200,6 +2369,34 @@ def shared_keyword_tiers(widget):
     return tiers
 
 
+def signature_bar(parent):
+    """One-line status of the signature DB with Reload / Open file buttons.
+    The returned frame has a .refresh() method to update the label."""
+    bar = ttk.Frame(parent)
+    status = tk.StringVar(value=SIGDB.status)
+
+    def refresh():
+        status.set(SIGDB.status)
+
+    def reload():
+        SIGDB.load()
+        refresh()
+
+    def open_file():
+        try:
+            SIGDB.ensure_file()
+            os.startfile(SIGDB.path)
+        except OSError as exc:
+            messagebox.showerror("Signature DB", f"Couldn't open {SIGDB.path}\n{exc}")
+        refresh()
+
+    ttk.Label(bar, textvariable=status).pack(side="left")
+    ttk.Button(bar, text="Reload", command=reload).pack(side="left", padx=(8, 0))
+    ttk.Button(bar, text="Open file", command=open_file).pack(side="left", padx=4)
+    bar.refresh = refresh
+    return bar
+
+
 # ---------------------------------------------------------------------------
 # Reusable widgets
 # ---------------------------------------------------------------------------
@@ -3038,19 +3235,23 @@ class DLLScannerTab(ScanTab):
             "catches cheats injected as a module rather than run as their own "
             "visible program. \"Location\" just tells you whether the file sits "
             "under Windows' system folder or the game's own folder; anything "
-            "else is worth a closer look, not automatic proof of anything.")
-    COLUMNS = (("name", "Module", 220), ("location", "Location", 110),
-               ("base", "Base address", 140), ("size", "Size (bytes)", 90),
-               ("path", "Full path", 440))
+            "else is worth a closer look, not automatic proof of anything. Modules "
+            "outside the Windows folder are also SHA-256 hashed and checked against "
+            "signatures.json; an exact match is shown in red.")
+    COLUMNS = (("name", "Module", 200), ("location", "Location", 100),
+               ("signature", "Signature match", 170), ("base", "Base address", 140),
+               ("size", "Size (bytes)", 90), ("path", "Full path", 400))
     STRETCH = "path"
-    SEARCH_KEYS = ("name", "path", "location")
-    EXPORT_HEADER = ["module", "location", "base_address", "size_bytes", "path"]
+    SEARCH_KEYS = ("name", "path", "location", "signature")
+    EXPORT_HEADER = ["module", "location", "signature_match", "base_address", "size_bytes",
+                     "sha256", "path"]
     SCAN_LABEL = "Scan loaded modules"
-    THREADED = False        # a module snapshot is near-instant
+    THREADED = True         # hashing the non-system modules takes a moment
 
     def build_top(self):
         self.procs = ProcessPicker(self, status_cb=self.set_status, show_admin=True)
         self.procs.pack(fill="x", pady=(8, 0))
+        signature_bar(self).pack(fill="x", pady=(6, 0))
 
     def after_build(self):
         self.procs.refresh()
@@ -3079,17 +3280,38 @@ class DLLScannerTab(ScanTab):
                 location = "game folder"
             else:
                 location = "other"
-            rows.append({**m, "location": location})
+            digest, signature, severity = "", "", ""
+            if location != "system":
+                try:
+                    digest = _sha256_of(m["path"], os.path.getsize(m["path"]), VERSION_HASH_CAP)
+                except OSError:
+                    digest = ""
+                known = SIGDB.lookup_hash(digest)
+                if known:
+                    name, severity, note = known
+                    signature = name + (f" ({note})" if note else "")
+            if digest.startswith("("):          # "(too large to hash)" isn't a hash
+                digest = ""
+            rows.append({**m, "location": location, "signature": signature,
+                         "severity": severity, "sha256": digest})
+        rows.sort(key=lambda r: -SEVERITY_RANK[r["severity"]])    # stable: matches float up
         return rows
 
     def done_message(self, rows):
-        return f"PID {self.scanned_pid}: {len(rows)} loaded module(s)."
+        hits = sum(1 for r in rows if r["signature"])
+        extra = f"; {hits} matched the signature DB" if hits else ""
+        return f"PID {self.scanned_pid}: {len(rows)} loaded module(s){extra}."
+
+    def row_tags(self, m):
+        return (m["severity"],) if m["severity"] else ()
 
     def row_values(self, m):
-        return (m["name"], m["location"], f"0x{m['base']:016X}", m["size"], m["path"])
+        return (m["name"], m["location"], m["signature"], f"0x{m['base']:016X}", m["size"],
+                m["path"])
 
     def export_row(self, m):
-        return list(self.row_values(m))
+        return [m["name"], m["location"], m["signature"], f"0x{m['base']:016X}", m["size"],
+                m["sha256"], m["path"]]
 
 
 # ---------------------------------------------------------------------------
@@ -3187,7 +3409,10 @@ class ModsScannerTab(AuditTab):
             "its class/package/resource names, file name and declared mod name are checked "
             "against the Memory Scan keyword list, so a renamed cheat is still caught. Red = "
             "distinctive cheat name, amber = common word (check the evidence in the box below). "
-            "Hashes are skipped for mods over 20 MB (64 MB for game versions).")
+            "Hashes are skipped for mods over 20 MB (64 MB for game versions). Each jar is also "
+            "checked against signatures.json: an exact SHA-256 match or a known cheat entry path "
+            "shows as \"HIGH: signature <name>\". A hash only matches an unmodified copy of "
+            "the file, so no match does not mean the jar is clean.")
     COLUMNS = (("flags", "Flags", 150), ("file", "File / version", 190),
                ("info", "Declared name / info", 150), ("kind", "Kind", 55),
                ("launcher", "Launcher", 100), ("profile", "Profile/instance", 110),
@@ -3216,6 +3441,39 @@ class ModsScannerTab(AuditTab):
                   ).pack(side="left")
         self.extra_kw = tk.StringVar()
         ttk.Entry(row, textvariable=self.extra_kw, width=40).pack(side="left", padx=6)
+        self.sig_bar = signature_bar(opt)
+        self.sig_bar.pack(fill="x", pady=(4, 0))
+        ttk.Button(self.sig_bar, text="Add selected jar to DB...",
+                   command=self.add_selected_to_db).pack(side="left", padx=4)
+
+    def add_selected_to_db(self):
+        sel = self.tree.selection()
+        visible = self.visible_rows()
+        idx = self.tree.index(sel[0]) if sel else -1
+        if not 0 <= idx < len(visible):
+            messagebox.showinfo("Add to signature DB", "Select a row in the table first.")
+            return
+        row = visible[idx]
+        if not _SHA256_RE.fullmatch(row["sha256"] or ""):
+            messagebox.showwarning("Add to signature DB",
+                                   "This row has no SHA-256 (no jar, or too large to hash).")
+            return
+        if not messagebox.askyesno(
+                "Add to signature DB",
+                f"Only add files you have confirmed are cheats - a wrong entry will flag "
+                f"innocent players later.\n\nAdd {row['file']} to signatures.json?"):
+            return
+        name = simpledialog.askstring("Add to signature DB", "Name of the cheat/client:",
+                                      parent=self)
+        if not name or not name.strip():
+            return
+        err = SIGDB.add_hash(row["sha256"], name.strip(), "high", f"seen as {row['file']}")
+        self.sig_bar.refresh()
+        if err:
+            messagebox.showwarning("Add to signature DB", err)
+        else:
+            messagebox.showinfo("Add to signature DB",
+                                f"Added {name.strip()}. It will be flagged on the next scan.")
 
     def keyword_tiers(self):
         """The shared keyword list plus this scan's extra keywords."""
@@ -3234,8 +3492,10 @@ class ModsScannerTab(AuditTab):
 
     def done_message(self, rows):
         mods = sum(1 for r in rows if r["kind"] == "mod")
+        sigs = sum(1 for r in rows if "signature " in r["flags"])
+        sig_note = f"; {sigs} known-signature match(es)" if sigs else ""
         return (f"Found {mods} mod jar(s) and {len(rows) - mods} game version(s); "
-                f"{self.flag_summary(rows)}.")
+                f"{self.flag_summary(rows)}{sig_note}.")
 
     def row_values(self, m):
         return (m["flags"], m["file"], m["info"], m["kind"], m["launcher"], m["profile"],
@@ -3250,6 +3510,188 @@ class ModsScannerTab(AuditTab):
                 f"Flags: {m['flags'] or 'none'}\n"
                 f"Evidence: {m['evidence'] or '-'}\n"
                 f"SHA-256: {m['sha256'] or '-'}")
+
+
+# ---------------------------------------------------------------------------
+# Jar Inspector tab (one file: hash, last modified, add to signatures.json)
+# ---------------------------------------------------------------------------
+INSPECT_HASH_CAP = 1 << 30            # the inspector hashes anything up to 1 GB
+
+
+class JarInspectorTab(ttk.Frame):
+    NOTE = ("Pick one file - normally a mod jar - to see its SHA-256 and last-modified date, "
+            "whether it is already in signatures.json, and what the keyword list and signature "
+            "database make of it. If you have confirmed it is a cheat, \"Add to signature.json\" "
+            "saves its hash so every later Mods Scanner / DLL Scanner scan flags that exact file. "
+            "Only mark files you are sure about: a wrong entry will flag innocent players.")
+    FIELDS = (("path", "File"), ("size", "Size"), ("modified", "Last modified"),
+              ("sha256", "SHA-256"), ("known", "Signature DB"),
+              ("flags", "Flags"))
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.result = None
+        self.busy = False
+        self.results_q = queue.Queue()
+        self.status = tk.StringVar()
+
+        note = ttk.Label(self, text=self.NOTE, justify="left")
+        note.pack(fill="x")
+        note.bind("<Configure>", lambda e: note.configure(wraplength=max(200, e.width)))
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(8, 0))
+        self.path_var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=self.path_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.inspect())
+        ttk.Button(row, text="Browse...", command=self.browse).pack(side="left", padx=4)
+        self.inspect_btn = ttk.Button(row, text="Inspect", command=self.inspect)
+        self.inspect_btn.pack(side="left")
+
+        box = ttk.LabelFrame(self, text="Result", padding=8)
+        box.pack(fill="x", pady=(10, 0))
+        box.grid_columnconfigure(1, weight=1)
+        self.vars = {}
+        for i, (key, label) in enumerate(self.FIELDS):
+            ttk.Label(box, text=f"{label}:").grid(row=i, column=0, sticky="w", padx=(0, 8), pady=2)
+            var = tk.StringVar(value="-")
+            ttk.Entry(box, textvariable=var, state="readonly").grid(row=i, column=1, sticky="ew",
+                                                                      pady=2)
+            self.vars[key] = var
+
+        ttk.Label(self, text="Evidence:").pack(anchor="w", pady=(8, 0))
+        self.evidence = tk.Text(self, height=5, wrap="word", state="disabled")
+        self.evidence.pack(fill="both", expand=True)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", pady=(8, 0))
+        self.copy_btn = ttk.Button(btns, text="Copy SHA-256", command=self.copy_hash,
+                                   state="disabled")
+        self.copy_btn.pack(side="left")
+        self.add_btn = ttk.Button(btns, text="Add to signature.json as marked cheat...",
+                                  command=self.add_to_db, state="disabled")
+        self.add_btn.pack(side="left", padx=6)
+        ttk.Label(btns, textvariable=self.status).pack(side="left", padx=6)
+
+        self.sig_bar = signature_bar(self)
+        self.sig_bar.pack(fill="x", pady=(8, 0))
+
+    # ---- choosing + inspecting ------------------------------------------
+    def browse(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Mod jars", "*.jar *.disabled"), ("All files", "*.*")])
+        if path:
+            self.path_var.set(os.path.normpath(path))
+            self.inspect()
+
+    def inspect(self):
+        if self.busy:
+            return
+        path = self.path_var.get().strip().strip('"')
+        if not os.path.isfile(path):
+            messagebox.showwarning("Jar Inspector", "Choose an existing file first.")
+            return
+        self.busy = True
+        self.inspect_btn.configure(state="disabled")
+        self.status.set("Hashing and opening the file...")
+        tiers = shared_keyword_tiers(self)
+        threading.Thread(target=self._work, args=(path, tiers), daemon=True).start()
+        self.after(100, self._poll)
+
+    def _work(self, path, tiers):
+        try:
+            if path.lower().endswith(JAR_SUFFIXES):
+                row = describe_jar(path, os.path.basename(path), build_keyword_matcher(tiers),
+                                   hash_cap=INSPECT_HASH_CAP)
+            else:                                   # a DLL or any other file: hash + date only
+                st = os.stat(path)
+                digest = _sha256_of(path, st.st_size, INSPECT_HASH_CAP)
+                hits, evidence = SIGDB.match_hash(digest)
+                row = {"file": os.path.basename(path), "path": path, "size": st.st_size,
+                       "modified": datetime.fromtimestamp(st.st_mtime), "sha256": digest,
+                       "flags": format_flags(hits), "severity": worst_tier(hits),
+                       "evidence": evidence}
+            self.results_q.put(("ok", row))
+        except Exception as exc:                    # surface anything instead of a dead button
+            self.results_q.put(("err", str(exc)))
+
+    def _poll(self):
+        try:
+            kind, payload = self.results_q.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll)
+            return
+        self.busy = False
+        self.inspect_btn.configure(state="normal")
+        if kind == "err" or payload is None:
+            self.status.set("")
+            messagebox.showerror("Jar Inspector",
+                                 f"Couldn't read that file.\n{payload or ''}".strip())
+            return
+        self.show(payload)
+
+    # ---- showing the result -----------------------------------------------
+    @staticmethod
+    def _valid_hash(row):
+        return row["sha256"] if _SHA256_RE.fullmatch(row.get("sha256") or "") else ""
+
+    def show(self, row):
+        self.result = row
+        digest = self._valid_hash(row)
+        known = SIGDB.lookup_hash(digest) if digest else None
+        if known:
+            known_text = f"Already in signatures.json as {known[0]} ({known[1]})"
+        elif digest:
+            known_text = "Not in signatures.json"
+        else:
+            known_text = "-"
+        self.vars["path"].set(row["path"])
+        self.vars["size"].set(f"{row['size']:,} bytes")
+        self.vars["modified"].set(fmt_dt(row["modified"]))
+        self.vars["sha256"].set(digest or row["sha256"] or "(couldn't read the file)")
+        self.vars["known"].set(known_text)
+        self.vars["flags"].set(row["flags"] or "none")
+        self.evidence.configure(state="normal")
+        self.evidence.delete("1.0", "end")
+        self.evidence.insert("1.0", row["evidence"] or "No keyword or signature evidence.")
+        self.evidence.configure(state="disabled")
+        self.copy_btn.configure(state="normal" if digest else "disabled")
+        self.add_btn.configure(state="normal" if digest and not known else "disabled")
+        self.status.set("")
+
+    def copy_hash(self):
+        digest = self._valid_hash(self.result or {"sha256": ""})
+        if digest:
+            self.clipboard_clear()
+            self.clipboard_append(digest)
+            self.status.set("SHA-256 copied.")
+
+    def add_to_db(self):
+        row = self.result
+        digest = self._valid_hash(row or {"sha256": ""})
+        if not digest:
+            return
+        if not messagebox.askyesno(
+                "Add to signature.json",
+                f"Only add files you have confirmed are cheats - a wrong entry will flag "
+                f"innocent players later.\n\nMark {row['file']} as a cheat?"):
+            return
+        name = simpledialog.askstring("Add to signature.json", "Name of the cheat/client:",
+                                      parent=self)
+        if not name or not name.strip():
+            return
+        err = SIGDB.add_hash(digest, name.strip(), "high",
+                             f"marked from Jar Inspector: {row['file']}, "
+                             f"modified {fmt_dt(row['modified'])}")
+        self.sig_bar.refresh()
+        if err:
+            messagebox.showwarning("Add to signature.json", err)
+        else:
+            self.status.set(f"Added {name.strip()} to signatures.json.")
+        self.show(row)
+        if not err:
+            self.status.set(f"Added {name.strip()} to signatures.json.")
 
 
 # ---------------------------------------------------------------------------
@@ -3856,10 +4298,16 @@ class CreditsTab(ttk.Frame):
 # ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
-LIGHT_COLORS = dict(bg="#f0f0f0", fg="#000000", field_bg="#ffffff", select="#3399ff",
-                    select_fg="#ffffff", high="#c62828", context="#a15c00")
-DARK_COLORS = dict(bg="#1e1e1e", fg="#e6e6e6", field_bg="#2b2b2b", select="#3a6ea5",
-                   select_fg="#ffffff", high="#ff6b6b", context="#e0a030")
+# Palettes follow the Sun Valley (Windows 11) theme so classic tk widgets
+# (Text / Listbox / Canvas / sidebar) match the ttk ones.
+LIGHT_COLORS = dict(bg="#fafafa", fg="#1a1a1a", field_bg="#ffffff", select="#005fb8",
+                    select_fg="#ffffff", high="#c62828", context="#a15c00",
+                    border="#d0d0d0", accent="#005fb8", hover="#f0f0f0",
+                    active="#e4e4e4", muted="#707070")
+DARK_COLORS = dict(bg="#1c1c1c", fg="#f2f2f2", field_bg="#2b2b2b", select="#57c8ff",
+                   select_fg="#000000", high="#ff6b6b", context="#e0a030",
+                   border="#404040", accent="#57c8ff", hover="#282828",
+                   active="#363636", muted="#a0a0a0")
 
 # (tab title, tab class) in display order - add a new tab by adding a line here.
 TABS = [
@@ -3867,6 +4315,7 @@ TABS = [
     ("DLL Scanner", DLLScannerTab),
     ("Log Checker", LogCheckerTab),
     ("Mods Scanner", ModsScannerTab),
+    ("Jar Inspector", JarInspectorTab),
     ("Versions Audit", VersionsAuditTab),
     ("Servers", ServersTab),
     ("Recycle Bin", RecycleBinTab),
@@ -3877,42 +4326,72 @@ TABS = [
     ("Process Timeline", ProcessTimelineTab),
     ("Credits", CreditsTab),
 ]
+PINNED_BOTTOM = {"Credits"}      # these sidebar entries sit at the bottom
+
+
+class SidebarItem(tk.Frame):
+    """One clickable sidebar entry: accent bar + label, with hover/selected states."""
+
+    def __init__(self, parent, text, command):
+        super().__init__(parent, cursor="hand2")
+        self.selected = False
+        self.hovered = False
+        self.colors = LIGHT_COLORS
+        self.bar = tk.Frame(self, width=3)
+        self.bar.pack(side="left", fill="y", pady=6)
+        self.label = tk.Label(self, text=text, anchor="w", font=("Segoe UI", 10),
+                              padx=12, pady=7)
+        self.label.pack(side="left", fill="x", expand=True)
+        for w in (self, self.bar, self.label):
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: self._set_hover())
+            w.bind("<Leave>", lambda e: self.after_idle(self._set_hover))
+
+    def _set_hover(self):
+        try:
+            under = self.winfo_containing(*self.winfo_pointerxy())
+        except (KeyError, tk.TclError):
+            return
+        hovered = under is not None and (under is self or str(under).startswith(str(self) + "."))
+        if hovered != self.hovered:
+            self.hovered = hovered
+            self.apply(self.colors)
+
+    def set_selected(self, selected):
+        self.selected = selected
+        self.apply(self.colors)
+
+    def apply(self, c):
+        self.colors = c
+        bg = c["active"] if self.selected else (c["hover"] if self.hovered else c["bg"])
+        self.configure(bg=bg)
+        self.label.configure(bg=bg, fg=c["fg"])
+        self.bar.configure(bg=c["accent"] if self.selected else bg)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {VERSION_LABEL}")
-        self.geometry("1150x750")
-        self.minsize(950, 600)
+        self.geometry("1200x780")
+        self.minsize(1000, 640)
 
         self.style = ttk.Style(self)
-        # Always use "clam" (not the native "vista" theme) for BOTH light and dark mode.
-        # "vista" is natively drawn and only partially respects color overrides, which
-        # is what caused light mode text/background to look broken after a theme switch.
-        # "clam" honors every color we set, so both modes render consistently.
         self.dark_mode = tk.BooleanVar(value=False)
         self.colors = LIGHT_COLORS
+        self.current = None
+        self.items = {}      # title -> SidebarItem
+        self.tabs = {}       # title -> tab widget
 
-        top = ttk.Frame(self)
-        top.pack(fill="x")
-        banner = ttk.Label(
-            top,
-            text=(f"{APP_NAME} {VERSION_LABEL} - for use during a screenshare the other "
-                  "person has agreed to. Results are leads to review, not proof of cheating."),
-            anchor="w", padding=4, foreground="#888")
-        banner.pack(side="left", fill="x", expand=True)
-        ttk.Checkbutton(top, text="Dark mode", variable=self.dark_mode,
-                        command=self.toggle_dark_mode).pack(side="right", padx=8)
+        self._build_sidebar()
+        ttk.Separator(self, orient="vertical").pack(side="left", fill="y")
+        self._build_main()
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
-        nb.enable_traversal()        # Ctrl+Tab / Ctrl+PageUp / Ctrl+PageDown switch tabs
-        self.tabs = {}
-        for title, tab_class in TABS:
-            tab = tab_class(nb)
-            nb.add(tab, text=title)
-            self.tabs[title] = tab
-
+        self.show_tab(TABS[0][0])
         self._apply_theme(LIGHT_COLORS)
+
+        self.bind("<Control-Next>", lambda e: self._step_tab(1))
+        self.bind("<Control-Prior>", lambda e: self._step_tab(-1))
 
         if psutil is None:
             messagebox.showwarning(
@@ -3921,17 +4400,112 @@ class App(tk.Tk):
                 "Recycle Bin tabs still work; Process Timeline needs psutil - "
                 "install manually with: pip install psutil")
 
+    # ---- layout -----------------------------------------------------------
+    def _build_sidebar(self):
+        side = ttk.Frame(self, width=220)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+
+        ttk.Label(side, text=APP_NAME, font=("Segoe UI Semibold", 14)
+                  ).pack(anchor="w", padx=16, pady=(18, 0))
+        ttk.Label(side, text=f"Screenshare helper \u00b7 {VERSION_LABEL}", foreground="gray"
+                  ).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # Bottom first (pack stacks bottom-up): dark-mode switch, then pinned tabs.
+        switch_style = "Switch.TCheckbutton" if sv_ttk else "TCheckbutton"
+        ttk.Checkbutton(side, text="Dark mode", style=switch_style,
+                        variable=self.dark_mode, command=self.toggle_dark_mode
+                        ).pack(side="bottom", anchor="w", padx=16, pady=(8, 16))
+        for title, _ in reversed(TABS):
+            if title in PINNED_BOTTOM:
+                self._add_item(side, title, "bottom")
+        for title, _ in TABS:
+            if title not in PINNED_BOTTOM:
+                self._add_item(side, title, "top")
+
+    def _add_item(self, parent, title, where):
+        item = SidebarItem(parent, title, lambda t=title: self.show_tab(t))
+        item.pack(side=where, fill="x", padx=(8, 8), pady=1)
+        self.items[title] = item
+
+    def _build_main(self):
+        main = ttk.Frame(self)
+        main.pack(side="left", fill="both", expand=True)
+
+        self.page_title = tk.StringVar()
+        ttk.Label(main, textvariable=self.page_title, font=("Segoe UI Semibold", 18)
+                  ).pack(anchor="w", padx=20, pady=(16, 4))
+
+        footer = ttk.Label(
+            main,
+            text=("For use during a screenshare the other person has agreed to. "
+                  "Results are leads to review, not proof of cheating."),
+            foreground="gray", anchor="w", justify="left")
+        footer.pack(side="bottom", fill="x", padx=20, pady=(4, 10))
+        footer.bind("<Configure>", lambda e: footer.configure(wraplength=max(200, e.width)))
+
+        content = ttk.Frame(main)
+        content.pack(fill="both", expand=True, padx=8)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+        for title, tab_class in TABS:
+            tab = tab_class(content)
+            tab.grid(row=0, column=0, sticky="nsew")
+            tab.grid_remove()                      # only the selected page is mapped
+            self.tabs[title] = tab
+
+    # ---- navigation -------------------------------------------------------
+    def show_tab(self, title):
+        if title == self.current:
+            return
+        if self.current:
+            self.tabs[self.current].grid_remove()
+            self.items[self.current].set_selected(False)
+        self.tabs[title].grid()
+        self.items[title].set_selected(True)
+        self.page_title.set(title)
+        self.current = title
+
+    def _step_tab(self, delta):
+        titles = [t for t, _ in TABS]
+        self.show_tab(titles[(titles.index(self.current) + delta) % len(titles)])
+
     # ---- theming ----------------------------------------------------------
     def toggle_dark_mode(self):
         self._apply_theme(DARK_COLORS if self.dark_mode.get() else LIGHT_COLORS)
 
     def _apply_theme(self, c):
         self.colors = c
+        dark = c is DARK_COLORS
+        if sv_ttk:
+            sv_ttk.set_theme("dark" if dark else "light")
+        else:
+            self._apply_fallback_theme(c)
+        self.configure(bg=c["bg"])
+        self._recolor_classic_widgets(self, c)
+        for item in self.items.values():
+            item.apply(c)
+        self._set_titlebar_dark(dark)
+
+    def _set_titlebar_dark(self, dark):
+        """Match the Windows title bar to the theme (Win10 1809+ / Win11)."""
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):       # DWMWA_USE_IMMERSIVE_DARK_MODE (new / old id)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                    break
+        except Exception:
+            pass
+
+    def _apply_fallback_theme(self, c):
+        """Used only when sv-ttk could not be installed: plain 'clam' with our colors."""
         s = self.style
         s.theme_use("clam")
         s.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field_bg"])
-        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label",
-                     "TCheckbutton", "TNotebook"):
+        for name in ("TFrame", "TLabel", "TLabelframe", "TLabelframe.Label", "TCheckbutton"):
             s.configure(name, background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("TButton", background=c["field_bg"], foreground=c["fg"])
@@ -3942,17 +4516,12 @@ class App(tk.Tk):
                     background=c["field_bg"])
         s.map("TCombobox", fieldbackground=[("readonly", c["field_bg"])],
               foreground=[("readonly", c["fg"])])
-        s.configure("TNotebook.Tab", background=c["field_bg"], foreground=c["fg"])
-        s.map("TNotebook.Tab", background=[("selected", c["select"])],
-              foreground=[("selected", c["select_fg"])])
         s.configure("Treeview", background=c["field_bg"], fieldbackground=c["field_bg"],
                     foreground=c["fg"])
         s.configure("Treeview.Heading", background=c["bg"], foreground=c["fg"])
         s.map("Treeview", background=[("selected", c["select"])],
               foreground=[("selected", c["select_fg"])])
         s.configure("Horizontal.TProgressbar", background=c["select"])
-        self.configure(bg=c["bg"])
-        self._recolor_classic_widgets(self, c)
 
     def _recolor_classic_widgets(self, widget, c):
         """ttk styles don't cover classic tk widgets (Text/Listbox/Canvas), so walk the
@@ -3960,7 +4529,9 @@ class App(tk.Tk):
         for child in widget.winfo_children():
             try:
                 if isinstance(child, (tk.Text, tk.Listbox)):
-                    opts = dict(bg=c["field_bg"], fg=c["fg"], highlightthickness=0,
+                    opts = dict(bg=c["field_bg"], fg=c["fg"], relief="flat", borderwidth=0,
+                                highlightthickness=1, highlightbackground=c["border"],
+                                highlightcolor=c["accent"],
                                 selectbackground=c["select"], selectforeground=c["select_fg"])
                     if isinstance(child, tk.Text):       # Listbox has no insertbackground option
                         opts["insertbackground"] = c["fg"]
