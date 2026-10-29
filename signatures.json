@@ -1,0 +1,5 @@
+{
+  "_help": "hashes: exact SHA-256 of confirmed cheat files. jar_patterns: text that appears in entry paths inside a cheat jar (min 6 chars). severity is 'high' or 'context'. Keys starting with _ are ignored.",
+  "hashes": [],
+  "jar_patterns": []
+}
