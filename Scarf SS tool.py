@@ -39,8 +39,8 @@ if sys.platform != "win32":
 
 # Version info. build.py reads and bumps these (python build.py --bump).
 APP_NAME = "Scarf's SS Tool"
-APP_VERSION = "2.3.2"
-APP_STAGE = "Beta"           # "Beta", or "" for a stable release
+APP_VERSION = "2.0"
+APP_STAGE = ""           # "Beta", or "" for a stable release
 VERSION_LABEL = f"{APP_VERSION} {APP_STAGE}".strip()
 FROZEN = getattr(sys, "frozen", False)      # True when running as the built .exe
 
