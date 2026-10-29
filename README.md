@@ -1,10 +1,17 @@
-# Scarf's SS Tool
+# Scarf's SS Tool (Future plans)
 
 A Windows GUI for checking a PC for cheat clients during a screenshare the
 other person has agreed to. Everything is visible and on-demand: it reads
 files, registry entries and process info that already exist, and never
 captures keystrokes or runs in the background. Results are leads to review,
 not proof of cheating.
+
+## Future plans
+Currently this branch stands as a road map for any features we would like to add to version 3 and beyond. 
+
+## Features that may release with 3.0
+- Adding an easier way to scan such as having options like "Light scan" which would do a memory and jar scan in conjunction
+- A more custom gui possibility based off of MacOS Tahoe
 
 ## Requirements
 - Windows
