@@ -39,8 +39,8 @@ if sys.platform != "win32":
 
 # Version info. build.py reads and bumps these (python build.py --bump).
 APP_NAME = "Scarf's SS Tool"
-APP_VERSION = "1.4"
-APP_STAGE = ""           # "Beta", or "" for a stable release
+APP_VERSION = "2.3.2"
+APP_STAGE = "Beta"           # "Beta", or "" for a stable release
 VERSION_LABEL = f"{APP_VERSION} {APP_STAGE}".strip()
 FROZEN = getattr(sys, "frozen", False)      # True when running as the built .exe
 
@@ -416,13 +416,15 @@ def find_keyword_strings(data, matchers, kw_regex, min_len):
 def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
     """Scan one process. Pushes ('hit', row) / ('progress', pct) onto q.
 
-    Returns (strings_seen, hits). strings_seen is None on the keyword-only fast
-    path, which skips listing every string (so there's no total to report)."""
+    Returns (strings_seen, hits, error). strings_seen is None on the keyword-only
+    fast path, which skips listing every string (so there's no total to report).
+    error is "" on success, otherwise why nothing could be scanned - a scan that
+    failed must never be reported as a clean "0 matches"."""
     handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not handle:
-        q.put(("status", f"Could not open PID {pid} (error {ctypes.get_last_error()}). "
-                         f"Try 'Run as admin'."))
-        return 0, 0
+        err = f"could not open the process (error {ctypes.get_last_error()}) - try 'Run as admin'"
+        q.put(("status", f"Could not open PID {pid}: {err}"))
+        return 0, 0, err
 
     ascii_re = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
     utf16_re = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % min_len)
@@ -440,7 +442,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                     "Python or use the 64-bit exe." if IS_32BIT_PYTHON else
                     " Try 'Run as admin', or the process may have just exited.")
             q.put(("status", f"No readable memory found in PID {pid}.{hint}"))
-            return total_strings, hits
+            return total_strings, hits, "no readable memory found" + hint.rstrip(".")
         total_bytes = sum(s for _, s in regions) or 1
         # Each read is a chunk plus overlap on both sides, never more than its region.
         buf = ctypes.create_string_buffer(
@@ -450,7 +452,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
             offset = 0
             while offset < size:
                 if stop.is_set():
-                    return total_strings, hits
+                    return total_strings, hits, ""
                 n = min(max_chunk, size - offset)
                 # Read a little before and after the chunk so a string (or keyword) that
                 # straddles a boundary is found whole. Only strings that START inside the
@@ -494,7 +496,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                 q.put(("progress", done_bytes * 100 / total_bytes))
     finally:
         kernel32.CloseHandle(handle)
-    return total_strings, hits
+    return total_strings, hits, ""
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +605,7 @@ def enumerate_recycle_bin(stop=None):
 # ---------------------------------------------------------------------------
 # Prefetch history
 # ---------------------------------------------------------------------------
-PREFETCH_DIR = r"C:\Windows\Prefetch"
+PREFETCH_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Prefetch")
 
 # Windows 10/11 compress every .pf file ("MAM" header, XPRESS-Huffman payload).
 # We decompress them with ntdll's RtlDecompressBufferEx - the same routine
@@ -910,7 +912,7 @@ def parse_hosts_file(path=HOSTS_PATH):
             continue
         ip = parts[0]
         for host in parts[1:]:
-            if host.lower() == "localhost":
+            if host.lower() == "localhost" and ip in LOOPBACK_IPS:
                 kind = HOSTS_DEFAULT
             elif ip in LOOPBACK_IPS:
                 kind = "blocks (points to loopback)"
@@ -1452,7 +1454,7 @@ def redact_secrets(text):
 def csv_safe(value):
     """Stop spreadsheet apps from running text taken from the inspected PC as a
     formula (cells starting with = + - @)."""
-    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+    if isinstance(value, str) and value != "-" and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + value
     return value
 
@@ -2334,10 +2336,13 @@ def ask_csv_path():
 
 
 def write_csv(path, header, rows):
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    """Every cell goes through csv_safe: names, paths and log text come from the
+    inspected PC, so none of it may be run as a formula when opened in Excel.
+    utf-8-sig so Excel reads non-ASCII names correctly. Raises OSError on failure."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
-        w.writerows(rows)
+        w.writerows([csv_safe(c) for c in r] for r in rows)
 
 
 def plural(n, one, many):
@@ -2739,7 +2744,11 @@ class TableTab(ttk.Frame):
         if not path:
             return
         rows = self.export_rows()
-        write_csv(path, self.EXPORT_HEADER, [self.export_row(r) for r in rows])
+        try:
+            write_csv(path, self.EXPORT_HEADER, [self.export_row(r) for r in rows])
+        except OSError as exc:
+            messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+            return
         self.set_status(f"Exported {len(rows)} rows to {path}")
 
 
@@ -3133,8 +3142,11 @@ class MemoryScanTab(TableTab):
                 if self.stop_event.is_set():
                     break
                 self.q.put(("status", f"Scanning PID {pid}..."))
-                total, hits = scan_pid(pid, kw_regex, min_len, self.stop_event, self.q,
-                                       dump_file, keywords=self.kw_tiers)
+                total, hits, err = scan_pid(pid, kw_regex, min_len, self.stop_event, self.q,
+                                            dump_file, keywords=self.kw_tiers)
+                if err:
+                    summary.append(f"PID {pid}: SCAN FAILED - {err}")
+                    continue
                 strings = "" if total is None else f"{total} strings, "
                 summary.append(f"PID {pid}: {strings}{hits} matches")
         except Exception as exc:
@@ -3189,8 +3201,13 @@ class MemoryScanTab(TableTab):
                 saved = f"Log saved: {log_path}"
             except OSError as exc:
                 saved = f"Log not saved ({exc})."
-        state = "Stopped" if self.stop_event.is_set() else "Done"
+        failed = "SCAN FAILED" in summary
+        state = "Stopped" if self.stop_event.is_set() else ("Finished with errors" if failed else "Done")
         self.set_status(f"{state}. {summary or 'No data.'}  {saved}")
+        if failed:
+            messagebox.showwarning("Scan incomplete",
+                                   "At least one process could not be scanned, so 0 matches "
+                                   "does NOT mean clean:\n\n" + summary)
 
     # ---- clear, export -----------------------------------------------------
     def clear_results(self):
@@ -3509,6 +3526,188 @@ class ModsScannerTab(AuditTab):
                 f"Flags: {m['flags'] or 'none'}\n"
                 f"Evidence: {m['evidence'] or '-'}\n"
                 f"SHA-256: {m['sha256'] or '-'}")
+
+
+# ---------------------------------------------------------------------------
+# Jar Inspector tab (one file: hash, last modified, add to signatures.json)
+# ---------------------------------------------------------------------------
+INSPECT_HASH_CAP = 1 << 30            # the inspector hashes anything up to 1 GB
+
+
+class JarInspectorTab(ttk.Frame):
+    NOTE = ("Pick one file - normally a mod jar - to see its SHA-256 and last-modified date, "
+            "whether it is already in signatures.json, and what the keyword list and signature "
+            "database make of it. If you have confirmed it is a cheat, \"Add to signature.json\" "
+            "saves its hash so every later Mods Scanner / DLL Scanner scan flags that exact file. "
+            "Only mark files you are sure about: a wrong entry will flag innocent players.")
+    FIELDS = (("path", "File"), ("size", "Size"), ("modified", "Last modified"),
+              ("sha256", "SHA-256"), ("known", "Signature DB"),
+              ("flags", "Flags"))
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=8)
+        self.result = None
+        self.busy = False
+        self.results_q = queue.Queue()
+        self.status = tk.StringVar()
+
+        note = ttk.Label(self, text=self.NOTE, justify="left")
+        note.pack(fill="x")
+        note.bind("<Configure>", lambda e: note.configure(wraplength=max(200, e.width)))
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(8, 0))
+        self.path_var = tk.StringVar()
+        entry = ttk.Entry(row, textvariable=self.path_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self.inspect())
+        ttk.Button(row, text="Browse...", command=self.browse).pack(side="left", padx=4)
+        self.inspect_btn = ttk.Button(row, text="Inspect", command=self.inspect)
+        self.inspect_btn.pack(side="left")
+
+        box = ttk.LabelFrame(self, text="Result", padding=8)
+        box.pack(fill="x", pady=(10, 0))
+        box.grid_columnconfigure(1, weight=1)
+        self.vars = {}
+        for i, (key, label) in enumerate(self.FIELDS):
+            ttk.Label(box, text=f"{label}:").grid(row=i, column=0, sticky="w", padx=(0, 8), pady=2)
+            var = tk.StringVar(value="-")
+            ttk.Entry(box, textvariable=var, state="readonly").grid(row=i, column=1, sticky="ew",
+                                                                      pady=2)
+            self.vars[key] = var
+
+        ttk.Label(self, text="Evidence:").pack(anchor="w", pady=(8, 0))
+        self.evidence = tk.Text(self, height=5, wrap="word", state="disabled")
+        self.evidence.pack(fill="both", expand=True)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", pady=(8, 0))
+        self.copy_btn = ttk.Button(btns, text="Copy SHA-256", command=self.copy_hash,
+                                   state="disabled")
+        self.copy_btn.pack(side="left")
+        self.add_btn = ttk.Button(btns, text="Add to signature.json as marked cheat...",
+                                  command=self.add_to_db, state="disabled")
+        self.add_btn.pack(side="left", padx=6)
+        ttk.Label(btns, textvariable=self.status).pack(side="left", padx=6)
+
+        self.sig_bar = signature_bar(self)
+        self.sig_bar.pack(fill="x", pady=(8, 0))
+
+    # ---- choosing + inspecting ------------------------------------------
+    def browse(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Mod jars", "*.jar *.disabled"), ("All files", "*.*")])
+        if path:
+            self.path_var.set(os.path.normpath(path))
+            self.inspect()
+
+    def inspect(self):
+        if self.busy:
+            return
+        path = self.path_var.get().strip().strip('"')
+        if not os.path.isfile(path):
+            messagebox.showwarning("Jar Inspector", "Choose an existing file first.")
+            return
+        self.busy = True
+        self.inspect_btn.configure(state="disabled")
+        self.status.set("Hashing and opening the file...")
+        tiers = shared_keyword_tiers(self)
+        threading.Thread(target=self._work, args=(path, tiers), daemon=True).start()
+        self.after(100, self._poll)
+
+    def _work(self, path, tiers):
+        try:
+            if path.lower().endswith(JAR_SUFFIXES):
+                row = describe_jar(path, os.path.basename(path), build_keyword_matcher(tiers),
+                                   hash_cap=INSPECT_HASH_CAP)
+            else:                                   # a DLL or any other file: hash + date only
+                st = os.stat(path)
+                digest = _sha256_of(path, st.st_size, INSPECT_HASH_CAP)
+                hits, evidence = SIGDB.match_hash(digest)
+                row = {"file": os.path.basename(path), "path": path, "size": st.st_size,
+                       "modified": datetime.fromtimestamp(st.st_mtime), "sha256": digest,
+                       "flags": format_flags(hits), "severity": worst_tier(hits),
+                       "evidence": evidence}
+            self.results_q.put(("ok", row))
+        except Exception as exc:                    # surface anything instead of a dead button
+            self.results_q.put(("err", str(exc)))
+
+    def _poll(self):
+        try:
+            kind, payload = self.results_q.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll)
+            return
+        self.busy = False
+        self.inspect_btn.configure(state="normal")
+        if kind == "err" or payload is None:
+            self.status.set("")
+            messagebox.showerror("Jar Inspector",
+                                 f"Couldn't read that file.\n{payload or ''}".strip())
+            return
+        self.show(payload)
+
+    # ---- showing the result -----------------------------------------------
+    @staticmethod
+    def _valid_hash(row):
+        return row["sha256"] if _SHA256_RE.fullmatch(row.get("sha256") or "") else ""
+
+    def show(self, row):
+        self.result = row
+        digest = self._valid_hash(row)
+        known = SIGDB.lookup_hash(digest) if digest else None
+        if known:
+            known_text = f"Already in signatures.json as {known[0]} ({known[1]})"
+        elif digest:
+            known_text = "Not in signatures.json"
+        else:
+            known_text = "-"
+        self.vars["path"].set(row["path"])
+        self.vars["size"].set(f"{row['size']:,} bytes")
+        self.vars["modified"].set(fmt_dt(row["modified"]))
+        self.vars["sha256"].set(digest or row["sha256"] or "(couldn't read the file)")
+        self.vars["known"].set(known_text)
+        self.vars["flags"].set(row["flags"] or "none")
+        self.evidence.configure(state="normal")
+        self.evidence.delete("1.0", "end")
+        self.evidence.insert("1.0", row["evidence"] or "No keyword or signature evidence.")
+        self.evidence.configure(state="disabled")
+        self.copy_btn.configure(state="normal" if digest else "disabled")
+        self.add_btn.configure(state="normal" if digest and not known else "disabled")
+        self.status.set("")
+
+    def copy_hash(self):
+        digest = self._valid_hash(self.result or {"sha256": ""})
+        if digest:
+            self.clipboard_clear()
+            self.clipboard_append(digest)
+            self.status.set("SHA-256 copied.")
+
+    def add_to_db(self):
+        row = self.result
+        digest = self._valid_hash(row or {"sha256": ""})
+        if not digest:
+            return
+        if not messagebox.askyesno(
+                "Add to signature.json",
+                f"Only add files you have confirmed are cheats - a wrong entry will flag "
+                f"innocent players later.\n\nMark {row['file']} as a cheat?"):
+            return
+        name = simpledialog.askstring("Add to signature.json", "Name of the cheat/client:",
+                                      parent=self)
+        if not name or not name.strip():
+            return
+        err = SIGDB.add_hash(digest, name.strip(), "high",
+                             f"marked from Jar Inspector: {row['file']}, "
+                             f"modified {fmt_dt(row['modified'])}")
+        self.sig_bar.refresh()
+        if err:
+            messagebox.showwarning("Add to signature.json", err)
+        else:
+            self.status.set(f"Added {name.strip()} to signatures.json.")
+        self.show(row)
+        if not err:
+            self.status.set(f"Added {name.strip()} to signatures.json.")
 
 
 # ---------------------------------------------------------------------------
@@ -3936,7 +4135,11 @@ class LogsPanel(ScanTab):
             return
         path = ask_csv_path()
         if path:
-            write_csv(path, ["account", "launches", "first_seen", "last_seen", "files"], rows)
+            try:
+                write_csv(path, ["account", "launches", "first_seen", "last_seen", "files"], rows)
+            except OSError as exc:
+                messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+                return
             self.set_status(f"Exported {len(rows)} account(s) to {path}")
 
     # ---- scanning ----------------------------------------------------------
@@ -4132,6 +4335,7 @@ TABS = [
     ("DLL Scanner", DLLScannerTab),
     ("Log Checker", LogCheckerTab),
     ("Mods Scanner", ModsScannerTab),
+    ("Jar Inspector", JarInspectorTab),
     ("Versions Audit", VersionsAuditTab),
     ("Servers", ServersTab),
     ("Recycle Bin", RecycleBinTab),
