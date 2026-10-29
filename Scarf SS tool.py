@@ -6,7 +6,6 @@ Tabs:
   - DLL Scanner:        lists DLLs loaded into a process; hashes flagged against signatures.json
   - Log Checker:        usernames seen in logs (possible alts) + launcher accounts
   - Mods Scanner:       finds mods folders, inspects jars (keywords + signature DB) and game versions
-  - Jar Inspector:      one file: SHA-256, last modified, and add it to signatures.json as a marked cheat
   - Versions Audit:     version folders vs. official hashes, JVM args, launcher profiles
   - Servers:            saved servers from servers.dat
   - Recycle Bin:        reads $Recycle.Bin metadata for deleted-file history
@@ -16,9 +15,7 @@ Tabs:
   - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
 
-Signature database: signatures.json (next to this script; NOTE: in a one-file .exe the
-script folder is a temporary folder that is deleted on exit, so keep the DB with the
-.py or build one-dir - edits made from a one-file exe will not persist) holds SHA-256 hashes of
+Signature database: signatures.json (next to this script) holds SHA-256 hashes of
 confirmed cheat files and jar entry-path patterns. Hash matches are exact-file matches,
 so a rebuilt or modified cheat will not match - treat a miss as "unknown", not "clean".
 Edit it by hand, or use "Add selected jar to DB" in the Mods Scanner tab.

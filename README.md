@@ -1,4 +1,8 @@
-# Scarf's SS Tool
+# Scarf's SS Tool (Beta)
+
+> **Beta release.** The interface was recently redesigned (sidebar navigation
+> and a new theme) and has not had broad testing yet. Expect rough edges, and
+> please report anything that looks or behaves wrong.
 
 A Windows GUI for checking a PC for cheat clients during a screenshare the
 other person has agreed to. Everything is visible and on-demand: it reads
@@ -12,12 +16,25 @@ not proof of cheating.
 - Admin rights are recommended (needed for Prefetch, the system-wide Windows
   Error Reporting folder, and some process memory/module access). Every tab
   that benefits has a "Run as admin" button.
+- Python packages (see `requirements.txt`): `psutil` and `sv-ttk`
 
 ## Run
 ```
 python Scarf_SS_tool.py
 ```
-Missing dependencies (`psutil`) install automatically on first run.
+Missing dependencies (`psutil`, `sv-ttk`) install automatically on first run.
+To install them yourself instead:
+```
+pip install -r requirements.txt
+```
+If `sv-ttk` can't be installed, the tool still runs using a plain fallback
+theme. If `psutil` is missing, only the Process Timeline tab is affected.
+
+## Interface
+- Tabs are listed in a **sidebar** on the left; click one to open it.
+  `Ctrl+PageUp` / `Ctrl+PageDown` switch between them.
+- The **Dark mode** switch and **Credits** are at the bottom of the sidebar.
+- Styled with the Sun Valley (Windows 11) theme via `sv-ttk`.
 
 ## Keywords
 One keyword list drives the Memory Scan, Mods Scanner, Versions Audit and
@@ -73,13 +90,16 @@ Matching in the file-based tabs ignores case, spaces, `_` and `-`, so
 - **Process Timeline**: lists what started after a chosen process or time,
   with optional auto-refresh.
 - Filtering, sortable columns and CSV export on the table tabs
-- Dark mode
+- Light and dark mode
 
 ## Notes
 - A flag is a reason to look closer, not a verdict. Amber flags in particular
   are often innocent (build tools, resource packs, legitimate agents).
 - The official-hash check in Versions Audit relies on a json file the user
   could also have edited, so treat it as a lead.
+- This is a beta: the new sidebar UI is lightly tested, especially on
+  high-DPI displays and older Windows 10 builds (the dark title bar needs
+  Windows 10 1809 or newer).
 
 ## Credits
 Scarf, Zelz, Clickbait, that random guy that told me about the log idea,
