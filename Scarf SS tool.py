@@ -16,7 +16,9 @@ Tabs:
   - Hosts Check:        active entries in the hosts file
   - Process Timeline:   lists processes that started after a reference time
 
-Signature database: signatures.json (next to this script) holds SHA-256 hashes of
+Signature database: signatures.json (next to this script; NOTE: in a one-file .exe the
+script folder is a temporary folder that is deleted on exit, so keep the DB with the
+.py or build one-dir - edits made from a one-file exe will not persist) holds SHA-256 hashes of
 confirmed cheat files and jar entry-path patterns. Hash matches are exact-file matches,
 so a rebuilt or modified cheat will not match - treat a miss as "unknown", not "clean".
 Edit it by hand, or use "Add selected jar to DB" in the Mods Scanner tab.
@@ -417,13 +419,15 @@ def find_keyword_strings(data, matchers, kw_regex, min_len):
 def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
     """Scan one process. Pushes ('hit', row) / ('progress', pct) onto q.
 
-    Returns (strings_seen, hits). strings_seen is None on the keyword-only fast
-    path, which skips listing every string (so there's no total to report)."""
+    Returns (strings_seen, hits, error). strings_seen is None on the keyword-only
+    fast path, which skips listing every string (so there's no total to report).
+    error is "" on success, otherwise why nothing could be scanned - a scan that
+    failed must never be reported as a clean "0 matches"."""
     handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not handle:
-        q.put(("status", f"Could not open PID {pid} (error {ctypes.get_last_error()}). "
-                         f"Try 'Run as admin'."))
-        return 0, 0
+        err = f"could not open the process (error {ctypes.get_last_error()}) - try 'Run as admin'"
+        q.put(("status", f"Could not open PID {pid}: {err}"))
+        return 0, 0, err
 
     ascii_re = re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
     utf16_re = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % min_len)
@@ -441,7 +445,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                     "Python or use the 64-bit exe." if IS_32BIT_PYTHON else
                     " Try 'Run as admin', or the process may have just exited.")
             q.put(("status", f"No readable memory found in PID {pid}.{hint}"))
-            return total_strings, hits
+            return total_strings, hits, "no readable memory found" + hint.rstrip(".")
         total_bytes = sum(s for _, s in regions) or 1
         # Each read is a chunk plus overlap on both sides, never more than its region.
         buf = ctypes.create_string_buffer(
@@ -451,7 +455,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
             offset = 0
             while offset < size:
                 if stop.is_set():
-                    return total_strings, hits
+                    return total_strings, hits, ""
                 n = min(max_chunk, size - offset)
                 # Read a little before and after the chunk so a string (or keyword) that
                 # straddles a boundary is found whole. Only strings that START inside the
@@ -495,7 +499,7 @@ def scan_pid(pid, kw_regex, min_len, stop, q, dump_file, keywords=()):
                 q.put(("progress", done_bytes * 100 / total_bytes))
     finally:
         kernel32.CloseHandle(handle)
-    return total_strings, hits
+    return total_strings, hits, ""
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +608,7 @@ def enumerate_recycle_bin(stop=None):
 # ---------------------------------------------------------------------------
 # Prefetch history
 # ---------------------------------------------------------------------------
-PREFETCH_DIR = r"C:\Windows\Prefetch"
+PREFETCH_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Prefetch")
 
 # Windows 10/11 compress every .pf file ("MAM" header, XPRESS-Huffman payload).
 # We decompress them with ntdll's RtlDecompressBufferEx - the same routine
@@ -911,7 +915,7 @@ def parse_hosts_file(path=HOSTS_PATH):
             continue
         ip = parts[0]
         for host in parts[1:]:
-            if host.lower() == "localhost":
+            if host.lower() == "localhost" and ip in LOOPBACK_IPS:
                 kind = HOSTS_DEFAULT
             elif ip in LOOPBACK_IPS:
                 kind = "blocks (points to loopback)"
@@ -1453,7 +1457,7 @@ def redact_secrets(text):
 def csv_safe(value):
     """Stop spreadsheet apps from running text taken from the inspected PC as a
     formula (cells starting with = + - @)."""
-    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+    if isinstance(value, str) and value != "-" and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + value
     return value
 
@@ -2335,10 +2339,13 @@ def ask_csv_path():
 
 
 def write_csv(path, header, rows):
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    """Every cell goes through csv_safe: names, paths and log text come from the
+    inspected PC, so none of it may be run as a formula when opened in Excel.
+    utf-8-sig so Excel reads non-ASCII names correctly. Raises OSError on failure."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
-        w.writerows(rows)
+        w.writerows([csv_safe(c) for c in r] for r in rows)
 
 
 def plural(n, one, many):
@@ -2740,7 +2747,11 @@ class TableTab(ttk.Frame):
         if not path:
             return
         rows = self.export_rows()
-        write_csv(path, self.EXPORT_HEADER, [self.export_row(r) for r in rows])
+        try:
+            write_csv(path, self.EXPORT_HEADER, [self.export_row(r) for r in rows])
+        except OSError as exc:
+            messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+            return
         self.set_status(f"Exported {len(rows)} rows to {path}")
 
 
@@ -3134,8 +3145,11 @@ class MemoryScanTab(TableTab):
                 if self.stop_event.is_set():
                     break
                 self.q.put(("status", f"Scanning PID {pid}..."))
-                total, hits = scan_pid(pid, kw_regex, min_len, self.stop_event, self.q,
-                                       dump_file, keywords=self.kw_tiers)
+                total, hits, err = scan_pid(pid, kw_regex, min_len, self.stop_event, self.q,
+                                            dump_file, keywords=self.kw_tiers)
+                if err:
+                    summary.append(f"PID {pid}: SCAN FAILED - {err}")
+                    continue
                 strings = "" if total is None else f"{total} strings, "
                 summary.append(f"PID {pid}: {strings}{hits} matches")
         except Exception as exc:
@@ -3190,8 +3204,13 @@ class MemoryScanTab(TableTab):
                 saved = f"Log saved: {log_path}"
             except OSError as exc:
                 saved = f"Log not saved ({exc})."
-        state = "Stopped" if self.stop_event.is_set() else "Done"
+        failed = "SCAN FAILED" in summary
+        state = "Stopped" if self.stop_event.is_set() else ("Finished with errors" if failed else "Done")
         self.set_status(f"{state}. {summary or 'No data.'}  {saved}")
+        if failed:
+            messagebox.showwarning("Scan incomplete",
+                                   "At least one process could not be scanned, so 0 matches "
+                                   "does NOT mean clean:\n\n" + summary)
 
     # ---- clear, export -----------------------------------------------------
     def clear_results(self):
@@ -4119,7 +4138,11 @@ class LogsPanel(ScanTab):
             return
         path = ask_csv_path()
         if path:
-            write_csv(path, ["account", "launches", "first_seen", "last_seen", "files"], rows)
+            try:
+                write_csv(path, ["account", "launches", "first_seen", "last_seen", "files"], rows)
+            except OSError as exc:
+                messagebox.showerror("Export", f"Could not write the file:\n{exc}")
+                return
             self.set_status(f"Exported {len(rows)} account(s) to {path}")
 
     # ---- scanning ----------------------------------------------------------
